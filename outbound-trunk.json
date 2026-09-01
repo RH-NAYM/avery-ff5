@@ -1,0 +1,11 @@
+{
+  "trunk": {
+    "name": "twilio-outbound",
+    "address": "ai-call-2026.pstn.twilio.com",
+    "transport": "SIP_TRANSPORT_TLS",
+    "mediaEncryption": "SIP_MEDIA_ENCRYPT_REQUIRE",
+    "numbers": [
+      "+19789915509"
+    ]
+  }
+}
