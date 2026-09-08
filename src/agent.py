@@ -22,7 +22,6 @@ from livekit.agents import (
 from livekit.plugins import (
     ai_coustics,
     cartesia,
-    deepgram,
     elevenlabs,
     google,
     openai,
@@ -33,7 +32,8 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("agent-Avery-ff5")
 
-load_dotenv(".env")
+load_dotenv(".env.local")  # local dev config, per README (git-ignored)
+load_dotenv(".env")  # optional fallback for anything not in .env.local
 
 # ai-coustics noise cancellation is billed either through a LiveKit Cloud
 # project or directly through your own ai-coustics license. For fully
@@ -50,15 +50,7 @@ def _require_env(name: str) -> str:
 
 
 def _build_stt(language: str = "en"):
-    provider = os.environ.get("STT_PROVIDER", "deepgram").lower()
-    if provider == "deepgram":
-        # nova-3 language support varies; verify the requested language is
-        # covered before relying on it for non-English calls.
-        return deepgram.STT(
-            model="nova-3",
-            language=language,
-            api_key=_require_env("DEEPGRAM_API_KEY"),
-        )
+    provider = os.environ.get("STT_PROVIDER", "google").lower()
     if provider == "elevenlabs":
         return elevenlabs.STT(
             api_key=_require_env("ELEVENLABS_API_KEY"),
@@ -66,12 +58,14 @@ def _build_stt(language: str = "en"):
         )
     if provider == "google":
         # Google Cloud Speech-to-Text, authenticated with a service account
-        # key file (see GOOGLE_APPLICATION_CREDENTIALS in .env.local).
+        # key file (see GOOGLE_APPLICATION_CREDENTIALS in .env.local). Same
+        # service account used by the Vertex AI fallback for
+        # LLM_PROVIDER=gemini / TTS_PROVIDER=gemini below.
         return google.STT(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS")
         )
     raise ValueError(
-        f"Unknown STT_PROVIDER: {provider!r} (expected 'deepgram', 'elevenlabs', or 'google')"
+        f"Unknown STT_PROVIDER: {provider!r} (expected 'elevenlabs' or 'google')"
     )
 
 
@@ -120,9 +114,20 @@ def _build_tts(language: str = "en"):
             enable_ssml_parsing=True,
         )
     if provider == "gemini":
+        gemini_tts_api_key = os.environ.get("GEMINI_API_KEY")
+        if gemini_tts_api_key:
+            return GeminiTTS(
+                voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
+                api_key=gemini_tts_api_key,
+            )
+        # No API key: fall back to Vertex AI using a Google Cloud service
+        # account (GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CLOUD_PROJECT /
+        # GOOGLE_CLOUD_LOCATION), same as LLM_PROVIDER=gemini above. The
+        # project is inferred from the service account key file and the
+        # location defaults to "us-central1" if not set.
         return GeminiTTS(
             voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
-            api_key=_require_env("GEMINI_API_KEY"),
+            vertexai=True,
         )
     if provider == "cartesia":
         return cartesia.TTS(
@@ -135,7 +140,7 @@ def _build_tts(language: str = "en"):
         # Google Cloud Text-to-Speech, authenticated with a service account
         # key file (see GOOGLE_APPLICATION_CREDENTIALS in .env.local). This
         # is distinct from TTS_PROVIDER=gemini above, which uses Gemini's
-        # own TTS model via a Gemini API key instead.
+        # own TTS model instead of the Cloud Text-to-Speech API.
         return google.TTS(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
             voice_name=os.environ.get("GOOGLE_TTS_VOICE") or NOT_GIVEN,

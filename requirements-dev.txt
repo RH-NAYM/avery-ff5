@@ -1,0 +1,42 @@
+# requirements-dev.txt for the LiveKit voice agent (avery-ff5)
+#
+# Adds test/lint tooling (pytest, pytest-asyncio, ruff) on top of the
+# runtime dependencies. Generated from uv.lock's 'dev' dependency group:
+#   uv export --format requirements.txt --only-dev --no-hashes --no-emit-project
+#
+# Install:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   pip install -e . --no-deps
+#
+# Run tests:
+#   pytest -q
+# (tests/test_agent.py's LLM-judge tests need LIVEKIT_API_KEY set - see
+# .env.example / README.md. Without it those 2 tests fail with
+# 'api_key is required'; the rest run fine.)
+
+-r requirements.txt
+
+backports-asyncio-runner==1.2.0 ; python_full_version < '3.11'
+    # via pytest-asyncio
+colorama==0.4.6 ; sys_platform == 'win32'
+    # via pytest
+exceptiongroup==1.3.1 ; python_full_version < '3.11'
+    # via pytest
+iniconfig==2.3.0
+    # via pytest
+packaging==26.3
+    # via pytest
+pluggy==1.6.0
+    # via pytest
+pygments==2.21.0
+    # via pytest
+pytest==9.1.1
+    # via pytest-asyncio
+pytest-asyncio==1.4.0
+ruff==0.16.5
+tomli==2.4.1 ; python_full_version < '3.11'
+    # via pytest
+typing-extensions==4.16.0 ; python_full_version < '3.13'
+    # via
+    #   exceptiongroup
+    #   pytest-asyncio
