@@ -15,6 +15,7 @@ from livekit.agents import (
     BuiltinAudioClip,
     ChatContext,
     JobContext,
+    JobProcess,
     TurnHandlingOptions,
     cli,
     room_io,
@@ -61,8 +62,18 @@ def _build_stt(language: str = "en"):
         # key file (see GOOGLE_APPLICATION_CREDENTIALS in .env.local). Same
         # service account used by the Vertex AI fallback for
         # LLM_PROVIDER=gemini / TTS_PROVIDER=gemini below.
+        #
+        # Optional: set GOOGLE_STT_MODEL="telephony" to use Google STT v2's
+        # model tuned for 8kHz phone-call audio (vs "latest_long" here,
+        # tuned for long-form dictation/video). NOT the default: "telephony"
+        # requires the Speech-to-Text v2 API and the
+        # speech.recognizers.recognize IAM permission on the service
+        # account, which this project's service account does not currently
+        # have (confirmed: it 403s on that permission) -- v1's "latest_long"
+        # is what your service account is actually provisioned for.
         return google.STT(
-            credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS")
+            credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
+            model=os.environ.get("GOOGLE_STT_MODEL", "latest_long"),
         )
     raise ValueError(
         f"Unknown STT_PROVIDER: {provider!r} (expected 'elevenlabs' or 'google')"
@@ -396,7 +407,15 @@ async def on_session_end(ctx: JobContext) -> None:
     )
 
 
-server = AgentServer()
+def prewarm(proc: JobProcess) -> None:
+    """Load the VAD model once per worker process instead of once per call.
+    Without this, entrypoint() would call silero.VAD.load() fresh on every
+    single job, paying ONNX model init time before the agent can start
+    listening -- on the critical path of every call's setup latency."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+server = AgentServer(setup_fnc=prewarm)
 
 
 @server.rtc_session(agent_name="Avery-ff5", on_session_end=on_session_end)
@@ -408,9 +427,15 @@ async def entrypoint(ctx: JobContext):
     callback_url = dial_info.get("callback_url")
     language = dial_info.get("language") or "en"
 
+    llm = _build_llm()
+    # Fire-and-forget: prewarm() schedules a background task and returns
+    # immediately, so this overlaps with the SIP dial-out below instead of
+    # adding connection-setup time to the caller's first turn.
+    llm.prewarm()
+
     session = AgentSession(
         stt=_build_stt(language),
-        llm=_build_llm(),
+        llm=llm,
         tts=_build_tts(language),
         turn_handling=TurnHandlingOptions(
             turn_detection=MultilingualModel(),
@@ -433,7 +458,7 @@ async def entrypoint(ctx: JobContext):
             # adds a cloud dependency for fully self-hosted local testing.
             interruption={"mode": "adaptive", "min_duration": 0.5, "min_words": 0},
         ),
-        vad=silero.VAD.load(),
+        vad=ctx.proc.userdata["vad"],
     )
 
     room_options_kwargs = {}
