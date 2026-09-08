@@ -15,6 +15,22 @@ ENV PYTHONUNBUFFERED=1
 # expense of a slightly longer build.
 ENV UV_COMPILE_BYTECODE=1
 
+# Pin the HuggingFace Hub cache path inside /app (rather than relying on the
+# default $HOME/.cache/huggingface) so the turn-detector model download below
+# ends up somewhere that actually survives into the final image. Without
+# this: the download step runs in the "build" stage as root (HOME=/root),
+# but the production stage creates a non-root "appuser" with HOME=/app and
+# only COPYs /app forward (line ~75) -- so the model downloaded under
+# /root/.cache never makes it into the final image, and the turn-detector
+# fails at runtime with "Could not find file ... Make sure you have
+# downloaded the model". Setting HF_HOME here (in the shared "base" stage,
+# before it diverges into build/production) makes both the build-time
+# download and the runtime lookup resolve to the same /app-relative path
+# regardless of which Linux user is active, so it's included in the
+# COPY --from=build --chown=appuser:appuser /app /app step below with
+# correct ownership already applied.
+ENV HF_HOME=/app/.cache/huggingface
+
 # --- Build stage ---
 # Install dependencies, build native extensions, and prepare the application
 FROM base AS build

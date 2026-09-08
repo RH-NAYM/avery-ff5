@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 
 import httpx
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ from livekit.agents import (
     BuiltinAudioClip,
     ChatContext,
     JobContext,
+    JobProcess,
     TurnHandlingOptions,
     cli,
     room_io,
@@ -34,6 +36,45 @@ logger = logging.getLogger("agent-Avery-ff5")
 
 load_dotenv(".env.local")  # local dev config, per README (git-ignored)
 load_dotenv(".env")  # optional fallback for anything not in .env.local
+
+
+def _materialize_google_credentials() -> None:
+    """Allow the Google service-account key to be supplied as inline JSON.
+
+    Locally, GOOGLE_APPLICATION_CREDENTIALS points at a real key file on
+    disk (see .env.local). LiveKit Cloud's agent secrets, however, are only
+    ever plain strings mounted as environment variables -- there's no way
+    to upload the key file itself, and the file is git-ignored so it never
+    reaches the deployed container's build context.
+
+    So in production, set a GOOGLE_CREDENTIALS_JSON secret containing the
+    *full contents* of the service-account JSON key file instead. If it's
+    present and no real file already exists at GOOGLE_APPLICATION_CREDENTIALS
+    (i.e. we're not in local dev), this writes it out to a temp file and
+    repoints GOOGLE_APPLICATION_CREDENTIALS at that file. Every google.STT /
+    google.LLM(vertexai=True) / GeminiTTS(vertexai=True) client resolves
+    credentials via that same env var (directly, or through Google's
+    Application Default Credentials chain), so this is a one-time fixup
+    that keeps all three working unmodified.
+    """
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json:
+        return
+
+    existing_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if existing_path and os.path.isfile(existing_path):
+        return  # a real credentials file already exists (e.g. local dev)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="gcp-credentials-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        f.write(creds_json)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
+    logger.info(
+        "Materialized Google credentials from GOOGLE_CREDENTIALS_JSON to %s", tmp_path
+    )
+
+
+_materialize_google_credentials()
 
 # ai-coustics noise cancellation is billed either through a LiveKit Cloud
 # project or directly through your own ai-coustics license. For fully
@@ -61,8 +102,18 @@ def _build_stt(language: str = "en"):
         # key file (see GOOGLE_APPLICATION_CREDENTIALS in .env.local). Same
         # service account used by the Vertex AI fallback for
         # LLM_PROVIDER=gemini / TTS_PROVIDER=gemini below.
+        #
+        # Optional: set GOOGLE_STT_MODEL="telephony" to use Google STT v2's
+        # model tuned for 8kHz phone-call audio (vs "latest_long" here,
+        # tuned for long-form dictation/video). NOT the default: "telephony"
+        # requires the Speech-to-Text v2 API and the
+        # speech.recognizers.recognize IAM permission on the service
+        # account, which this project's service account does not currently
+        # have (confirmed: it 403s on that permission) -- v1's "latest_long"
+        # is what your service account is actually provisioned for.
         return google.STT(
-            credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS")
+            credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
+            model=os.environ.get("GOOGLE_STT_MODEL", "latest_long"),
         )
     raise ValueError(
         f"Unknown STT_PROVIDER: {provider!r} (expected 'elevenlabs' or 'google')"
@@ -396,7 +447,15 @@ async def on_session_end(ctx: JobContext) -> None:
     )
 
 
-server = AgentServer()
+def prewarm(proc: JobProcess) -> None:
+    """Load the VAD model once per worker process instead of once per call.
+    Without this, entrypoint() would call silero.VAD.load() fresh on every
+    single job, paying ONNX model init time before the agent can start
+    listening -- on the critical path of every call's setup latency."""
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+server = AgentServer(setup_fnc=prewarm)
 
 
 @server.rtc_session(agent_name="Avery-ff5", on_session_end=on_session_end)
@@ -408,9 +467,15 @@ async def entrypoint(ctx: JobContext):
     callback_url = dial_info.get("callback_url")
     language = dial_info.get("language") or "en"
 
+    llm = _build_llm()
+    # Fire-and-forget: prewarm() schedules a background task and returns
+    # immediately, so this overlaps with the SIP dial-out below instead of
+    # adding connection-setup time to the caller's first turn.
+    llm.prewarm()
+
     session = AgentSession(
         stt=_build_stt(language),
-        llm=_build_llm(),
+        llm=llm,
         tts=_build_tts(language),
         turn_handling=TurnHandlingOptions(
             turn_detection=MultilingualModel(),
@@ -433,7 +498,7 @@ async def entrypoint(ctx: JobContext):
             # adds a cloud dependency for fully self-hosted local testing.
             interruption={"mode": "adaptive", "min_duration": 0.5, "min_words": 0},
         ),
-        vad=silero.VAD.load(),
+        vad=ctx.proc.userdata["vad"],
     )
 
     room_options_kwargs = {}
@@ -464,13 +529,19 @@ async def entrypoint(ctx: JobContext):
                     wait_until_answered=True,
                 )
             )
-        except api.SipCallError as e:
-            logger.warning(
-                "outbound call to %s failed: %s %s",
-                phone_number,
-                e.sip_status_code,
-                e.sip_status,
-            )
+        except api.ServerError as e:
+            # api.SipCallError (raised when the far end actively rejects the
+            # call -- busy, declined, invalid number) carries a SIP status
+            # code/reason. A ring that just times out with nobody answering
+            # -- or a lower-level SIP/trunk failure -- surfaces as a plain
+            # api.ServerError instead, with no SIP status attached. Catch the
+            # broader type so neither case crashes the job with an unhandled
+            # exception; report whichever detail is available.
+            if isinstance(e, api.SipCallError):
+                detail = f"{e.sip_status_code} {e.sip_status}"
+            else:
+                detail = f"{e.code} {e.message}"
+            logger.warning("outbound call to %s failed: %s", phone_number, detail)
             if call_id and callback_url:
                 # on_session_end won't fire since no session ever started;
                 # report the failure directly so the outbound call API
@@ -479,7 +550,7 @@ async def entrypoint(ctx: JobContext):
                     callback_url,
                     {
                         "call_id": call_id,
-                        "error": f"sip call failed: {e.sip_status_code} {e.sip_status}",
+                        "error": f"sip call failed: {detail}",
                     },
                 )
             ctx.shutdown(reason="sip call failed")
