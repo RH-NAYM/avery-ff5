@@ -254,3 +254,31 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+# Google Cloud service account keys
+#   Never commit a downloaded service-account JSON key. This covers the
+#   default GCP download filename (<project-id>-<12 hex chars>.json, e.g.
+#   silacares-352483309fdc.json) plus common manual names. Point
+#   GOOGLE_APPLICATION_CREDENTIALS at the file wherever you keep it -
+#   it does not need to live inside this repo.
+*-????????????.json
+service-account*.json
+*service-account.json
+gcp-credentials.json
+
+# Local credential-restore script (contains real secrets - never commit)
+restore-credentials.sh
+
+# Twilio outbound SIP trunk configs - contain a real Twilio SIP domain
+# and phone number(s), not just a template. Keep outbound-trunk.example.json
+# as the tracked template instead (see README's 'Outbound Phone Calls' section).
+outbound-trunk*.json
+!outbound-trunk.example.json
+
+
+
+.env.local
+silacares-352483309fdc.json
+outbound-trunk.json
+outbound-trunk copy.json
+SilaCare-restore-credentials.sh

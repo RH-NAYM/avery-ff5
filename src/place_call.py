@@ -21,7 +21,8 @@ from dotenv import load_dotenv
 from livekit import api
 from livekit.agents.utils import shortuuid
 
-load_dotenv(".env")
+load_dotenv(".env.local")  # local dev config, per README (git-ignored)
+load_dotenv(".env")  # optional fallback for anything not in .env.local
 
 
 async def place_call(phone_number: str) -> None:

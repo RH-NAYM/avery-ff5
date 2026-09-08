@@ -19,9 +19,27 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
 **Get up and running** so you can start customizing:
 
 1. **Install dependencies:**
+
+   This project is managed with [uv](https://docs.astral.sh/uv/):
    ```console
    uv sync
    ```
+
+   Prefer plain `pip`? A pinned `requirements.txt` (runtime deps) and
+   `requirements-dev.txt` (adds `pytest`/`ruff`, for the next step) are
+   included as an alternative, generated from `uv.lock`:
+   ```console
+   python3 -m venv .venv
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   pip install -r requirements.txt -r requirements-dev.txt
+   pip install -e . --no-deps
+   ```
+   `pip install -e . --no-deps` is required even with plain pip: it's what
+   puts `src/` on the Python path so `agent.py`/`api.py` can be run and
+   imported (e.g. by the tests below) without a `src.` prefix. `--no-deps`
+   keeps the exact versions pinned above instead of pip re-resolving them.
+   From here on, replace `uv run python ...` with `python ...` (with the
+   venv activated).
 
 2. **Set up your LiveKit credentials:**
 
@@ -32,6 +50,11 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
      - `LIVEKIT_API_KEY`
      - `LIVEKIT_API_SECRET`
      - any provider API key listed in `.env.example` (realtime models are bring-your-own-key)
+     - if you're using Google (Gemini LLM/TTS, or `STT_PROVIDER`/`TTS_PROVIDER=google`) with a
+       **service account** instead of an API key, you only need to set
+       `GOOGLE_APPLICATION_CREDENTIALS` to the JSON key file's path — the project is
+       auto-inferred from the key file itself, and the Vertex AI location defaults to
+       `us-central1`. Leave the matching API key (`GEMINI_API_KEY`) blank to trigger this.
 
    - **Automatic setup** (recommended): Use the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
      ```bash
@@ -51,7 +74,20 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
    ```
    This lets you speak to your agent directly in your terminal.
 
-5. **Run for development:**
+5. **Run the automated test suite:**
+   ```console
+   uv run pytest
+   ```
+   (with pip: `pytest`, after installing `requirements-dev.txt`.) `ruff check src tests` runs the linter the same way CI would.
+
+   Most tests run fully offline. The two LLM-judge tests in
+   `tests/test_agent.py` call out to
+   [LiveKit Inference](https://docs.livekit.io/agents/models/inference) to
+   grade the agent's replies, so they need `LIVEKIT_API_KEY` (a real
+   LiveKit Cloud project, not just a local `livekit-server --dev`
+   instance) — without it they fail with `api_key is required`.
+
+6. **Run for development:**
    ```console
    uv run python src/agent.py dev
    ```
@@ -60,7 +96,9 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
 
 ## Local Self-Hosted Development
 
-This project can run entirely on your own machine, with a self-hosted LiveKit Server, and **without a LiveKit Cloud account**. The agent still talks to external AI providers (Deepgram, Google Gemini, Cartesia) directly, using your own API keys, instead of routing through [LiveKit Inference](https://docs.livekit.io/agents/models/inference).
+This project can run entirely on your own machine, with a self-hosted LiveKit Server, and **without a LiveKit Cloud account**. The agent still talks to external AI providers directly, using your own credentials, instead of routing through [LiveKit Inference](https://docs.livekit.io/agents/models/inference).
+
+By default (`STT_PROVIDER`/`LLM_PROVIDER`/`TTS_PROVIDER=google`/`gemini`), that's a single Google Cloud service account covering all three stages via Vertex AI + Cloud Speech-to-Text:
 
 ```text
 Local LiveKit Server (livekit-server --dev)
@@ -68,10 +106,12 @@ Local LiveKit Server (livekit-server --dev)
         ▼
 LiveKit Agent Worker (src/agent.py)
         │
-        ├── STT  → Deepgram API      (DEEPGRAM_API_KEY)
-        ├── LLM  → Google Gemini API (GOOGLE_API_KEY)
-        └── TTS  → Cartesia API      (CARTESIA_API_KEY)
+        ├── STT  → Google Cloud Speech-to-Text  (GOOGLE_APPLICATION_CREDENTIALS)
+        ├── LLM  → Gemini via Vertex AI          (GOOGLE_APPLICATION_CREDENTIALS)
+        └── TTS  → Gemini TTS via Vertex AI      (GOOGLE_APPLICATION_CREDENTIALS)
 ```
+
+Every stage is independently swappable to a different provider (ElevenLabs, Cartesia, OpenAI, ...) via its own `*_PROVIDER` env var - see `.env.example` for the full list.
 
 ### 1. Install LiveKit Server
 
@@ -99,7 +139,7 @@ This starts a signaling server at `ws://localhost:7880` with fixed dev credentia
 
 ### 3. Configure `.env.local`
 
-Copy `.env.example` to `.env.local` and fill in your own Deepgram, Google, and Cartesia API keys. The LiveKit values already default to the local dev server:
+Copy `.env.example` to `.env.local` and fill in your own credentials (a Google Cloud service account by default, or swap in other providers). The LiveKit values already default to the local dev server:
 ```console
 cp .env.example .env.local
 ```
@@ -109,6 +149,7 @@ cp .env.example .env.local
 ```console
 uv sync
 ```
+(Prefer pip? See the `requirements.txt` alternative in the [Quickstart](#quickstart) section above.)
 
 ### 5. Download local model files
 
@@ -169,7 +210,6 @@ pip install torch torchaudio
 ### 3. Install this project + Coqui XTTS v2
 
 ```console
-cd "Avery-ff5"
 pip install -e ".[coqui]"
 ```
 
@@ -223,7 +263,11 @@ Install/update the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/) (`lk
 lk cloud auth
 ```
 
-Create `outbound-trunk.json`:
+Copy the tracked template and fill in your own trunk domain/numbers - `outbound-trunk.json` is git-ignored (it holds real phone numbers), so this file is where you customize it locally:
+
+```console
+cp outbound-trunk.example.json outbound-trunk.json
+```
 
 ```json
 {
@@ -303,7 +347,7 @@ Once your agent is running, enhance it for your use case:
 
 - **Customize AI models**: Your agent uses a voice AI pipeline built on [LiveKit Inference](https://docs.livekit.io/agents/models/inference). More than 50 model providers are supported, including [Realtime models](https://docs.livekit.io/agents/models/realtime).
 
-- **Add tests**: You can add a full test suite to your agent. See the [testing documentation](https://docs.livekit.io/agents/start/testing/) for more information.
+- **Add tests**: This project already ships a starter test suite in `tests/` (`uv run pytest`, or `pytest` with `requirements-dev.txt` installed via pip) — extend it as you customize the agent. See the [testing documentation](https://docs.livekit.io/agents/start/testing/) for more information.
 
 - **Build reliable workflows**: For complex agents, use [tasks and handoffs](https://docs.livekit.io/agents/build/workflows/) instead of long instruction prompts. This minimizes latency and improves reliability by structuring your agent into focused, reusable components.
 

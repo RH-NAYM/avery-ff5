@@ -34,7 +34,8 @@ from livekit import api as lk_api
 from livekit.agents.utils import shortuuid
 from pydantic import BaseModel
 
-load_dotenv(".env")
+load_dotenv(".env.local")  # local dev config, per README (git-ignored)
+load_dotenv(".env")  # optional fallback for anything not in .env.local
 
 logger = logging.getLogger("outbound-call-api")
 
