@@ -274,3 +274,11 @@ restore-credentials.sh
 # as the tracked template instead (see README's 'Outbound Phone Calls' section).
 outbound-trunk*.json
 !outbound-trunk.example.json
+
+
+
+.env.local
+silacares-352483309fdc.json
+outbound-trunk.json
+outbound-trunk copy.json
+SilaCare-restore-credentials.sh
