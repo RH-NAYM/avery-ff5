@@ -529,13 +529,19 @@ async def entrypoint(ctx: JobContext):
                     wait_until_answered=True,
                 )
             )
-        except api.SipCallError as e:
-            logger.warning(
-                "outbound call to %s failed: %s %s",
-                phone_number,
-                e.sip_status_code,
-                e.sip_status,
-            )
+        except api.ServerError as e:
+            # api.SipCallError (raised when the far end actively rejects the
+            # call -- busy, declined, invalid number) carries a SIP status
+            # code/reason. A ring that just times out with nobody answering
+            # -- or a lower-level SIP/trunk failure -- surfaces as a plain
+            # api.ServerError instead, with no SIP status attached. Catch the
+            # broader type so neither case crashes the job with an unhandled
+            # exception; report whichever detail is available.
+            if isinstance(e, api.SipCallError):
+                detail = f"{e.sip_status_code} {e.sip_status}"
+            else:
+                detail = f"{e.code} {e.message}"
+            logger.warning("outbound call to %s failed: %s", phone_number, detail)
             if call_id and callback_url:
                 # on_session_end won't fire since no session ever started;
                 # report the failure directly so the outbound call API
@@ -544,7 +550,7 @@ async def entrypoint(ctx: JobContext):
                     callback_url,
                     {
                         "call_id": call_id,
-                        "error": f"sip call failed: {e.sip_status_code} {e.sip_status}",
+                        "error": f"sip call failed: {detail}",
                     },
                 )
             ctx.shutdown(reason="sip call failed")
