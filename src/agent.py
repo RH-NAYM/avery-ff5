@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import tempfile
 
 import httpx
 from dotenv import load_dotenv
@@ -35,6 +36,45 @@ logger = logging.getLogger("agent-Avery-ff5")
 
 load_dotenv(".env.local")  # local dev config, per README (git-ignored)
 load_dotenv(".env")  # optional fallback for anything not in .env.local
+
+
+def _materialize_google_credentials() -> None:
+    """Allow the Google service-account key to be supplied as inline JSON.
+
+    Locally, GOOGLE_APPLICATION_CREDENTIALS points at a real key file on
+    disk (see .env.local). LiveKit Cloud's agent secrets, however, are only
+    ever plain strings mounted as environment variables -- there's no way
+    to upload the key file itself, and the file is git-ignored so it never
+    reaches the deployed container's build context.
+
+    So in production, set a GOOGLE_CREDENTIALS_JSON secret containing the
+    *full contents* of the service-account JSON key file instead. If it's
+    present and no real file already exists at GOOGLE_APPLICATION_CREDENTIALS
+    (i.e. we're not in local dev), this writes it out to a temp file and
+    repoints GOOGLE_APPLICATION_CREDENTIALS at that file. Every google.STT /
+    google.LLM(vertexai=True) / GeminiTTS(vertexai=True) client resolves
+    credentials via that same env var (directly, or through Google's
+    Application Default Credentials chain), so this is a one-time fixup
+    that keeps all three working unmodified.
+    """
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if not creds_json:
+        return
+
+    existing_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if existing_path and os.path.isfile(existing_path):
+        return  # a real credentials file already exists (e.g. local dev)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="gcp-credentials-", suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        f.write(creds_json)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmp_path
+    logger.info(
+        "Materialized Google credentials from GOOGLE_CREDENTIALS_JSON to %s", tmp_path
+    )
+
+
+_materialize_google_credentials()
 
 # ai-coustics noise cancellation is billed either through a LiveKit Cloud
 # project or directly through your own ai-coustics license. For fully
