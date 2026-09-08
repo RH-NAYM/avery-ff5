@@ -259,10 +259,43 @@ python src/place_call.py +12135550100
 
 This dispatches the agent (`src/place_call.py`) into a new room with the phone number in the job's metadata. `entrypoint()` in `agent.py` reads `phone_number` from that metadata, dials out via `ctx.api.sip.create_sip_participant(...)` with `wait_until_answered=True`, and only starts the conversation once the call is answered. A busy signal, decline, or no-answer raises `api.SipCallError` and the job shuts down without starting a session — check the agent's logs for the SIP status code/reason.
 
+### 4. Or trigger calls from a backend via the outbound call API
+
+`src/api.py` is a small FastAPI service for triggering a call from a real backend (a webhook, cron job, CRM integration) and getting a summary back once the conversation is over, instead of using the `place_call.py` CLI. Run it alongside the agent worker:
+
+```console
+# terminal 1: the agent worker (as in step 3 above, but via `dev` so it keeps running)
+python src/agent.py dev
+
+# terminal 2: the API
+uv run python src/api.py
+```
+
+`API_HOST` / `API_PORT` (defaults `0.0.0.0` / `8000`) override the bind address if needed.
+
+Then:
+
+```console
+curl -X POST http://localhost:8000/calls/outbound \
+  -H "Content-Type: application/json" \
+  -d '{
+    "call_type": "outbound",
+    "user_id": "user-123",
+    "number": "+12135550100",
+    "prompt": "You are Avery, calling to check in on ...",
+    "helper_prompt": "The user prefers short calls.",
+    "langage": "en"
+  }'
+```
+
+The request blocks until the call finishes (or `CALL_TIMEOUT_SECONDS`, default 900, elapses), then returns the same body with a `response_summary` field added. Unlike `place_call.py`'s fixed elder-companion persona, `prompt` here becomes the agent's full instructions for that call — `helper_prompt` is appended as supplementary context, and `langage` selects the STT/TTS language.
+
+Under the hood, `create_outbound_call` dispatches the agent with a `callback_url` in the job metadata pointing back at this API. When the conversation ends, the agent's `on_session_end` callback (in `agent.py`) summarizes `session.history` with a separate LLM call and POSTs it to that URL, which resolves the waiting request. Because that callback needs to reach this API's process, set `CALLBACK_BASE_URL` in `.env` (or the agent worker's environment) to wherever this API is actually reachable — the default `http://localhost:8000` only works when both processes share a host, which won't be true once the agent worker is deployed separately (for example, via `lk agent create`).
+
 ### What's not covered here
 
-- **Inbound calls** (someone calls your Twilio number and reaches the agent) need an inbound SIP trunk and a [dispatch rule](https://docs.livekit.io/sip/dispatch-rule/) instead of `place_call.py`'s explicit dispatch — see [Accepting inbound calls](https://docs.livekit.io/sip/accepting-calls/).
-- **Triggering calls from a real backend** (a webhook, cron job, CRM integration) — adapt `place_call()` in `src/place_call.py` to be called from wherever the phone number comes from, instead of the CLI `argv` shown here.
+- **Inbound calls** (someone calls your Twilio number and reaches the agent) need an inbound SIP trunk and a [dispatch rule](https://docs.livekit.io/sip/dispatch-rule/) instead of explicit dispatch — see [Accepting inbound calls](https://docs.livekit.io/sip/accepting-calls/).
+- **Restart resilience / multiple API processes** — `api.py` tracks in-flight calls in an in-memory dict, so a restart loses them and it only works behind a single process. Move `_pending_calls` to a shared store (Redis, a database) if you need either.
 
 ## Customize your agent
 

@@ -20,7 +20,10 @@ dependencies = [
     "livekit-plugins-silero~=1.7",
     "livekit-plugins-turn-detector~=1.7",
     "python-dotenv",
-    "python-handlebars"
+    "python-handlebars",
+    "httpx",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
