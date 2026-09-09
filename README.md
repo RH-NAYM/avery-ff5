@@ -303,6 +303,15 @@ python src/place_call.py +12135550100
 
 This dispatches the agent (`src/place_call.py`) into a new room with the phone number in the job's metadata. `entrypoint()` in `agent.py` reads `phone_number` from that metadata, dials out via `ctx.api.sip.create_sip_participant(...)` with `wait_until_answered=True`, and only starts the conversation once the call is answered. A busy signal, decline, or no-answer raises `api.SipCallError` and the job shuts down without starting a session — check the agent's logs for the SIP status code/reason.
 
+By default this uses Avery's built-in elder-companion persona (the same as a plain console/dev session). Pass `--prompt` (plus optional `--helper-prompt` and `--language`) to override the persona for that one call instead — the same override capability the outbound call API below has, without needing to run that whole service:
+
+```console
+python src/place_call.py +12135550100 \
+  --prompt "You are Avery, calling on behalf of Jane's son to check in." \
+  --helper-prompt "Jane prefers short calls and goes by 'Janie'." \
+  --language en
+```
+
 ### 4. Or trigger calls from a backend via the outbound call API
 
 `src/api.py` is a small FastAPI service for triggering a call from a real backend (a webhook, cron job, CRM integration) and getting a summary back once the conversation is over, instead of using the `place_call.py` CLI. Run it alongside the agent worker:
@@ -332,14 +341,171 @@ curl -X POST http://localhost:8000/calls/outbound \
   }'
 ```
 
-The request blocks until the call finishes (or `CALL_TIMEOUT_SECONDS`, default 900, elapses), then returns the same body with a `response_summary` field added. Unlike `place_call.py`'s fixed elder-companion persona, `prompt` here becomes the agent's full instructions for that call — `helper_prompt` is appended as supplementary context, and `langage` selects the STT/TTS language.
+This returns immediately (`202 Accepted`) with a `call_id` and `status: "pending"` — it does **not** block until the call finishes. An earlier version of this API held the HTTP connection open for up to `CALL_TIMEOUT_SECONDS` (default 900s / 15 minutes) per call, which doesn't scale under any real concurrency; poll for the result instead:
 
-Under the hood, `create_outbound_call` dispatches the agent with a `callback_url` in the job metadata pointing back at this API. When the conversation ends, the agent's `on_session_end` callback (in `agent.py`) summarizes `session.history` with a separate LLM call and POSTs it to that URL, which resolves the waiting request. Because that callback needs to reach this API's process, set `CALLBACK_BASE_URL` in `.env` (or the agent worker's environment) to wherever this API is actually reachable — the default `http://localhost:8000` only works when both processes share a host, which won't be true once the agent worker is deployed separately (for example, via `lk agent create`).
+```console
+curl http://localhost:8000/calls/<call_id>
+```
+
+which returns `status: "pending" | "completed" | "error" | "timeout"`, and once terminal, `response_summary` plus a structured `concern_level` (`"none"` / `"watch"` / `"urgent"`) and `flagged_topics` your backend can branch on without a human re-reading the summary — see `CallSummary` in `agent.py`. A call that's still `"pending"` after `CALL_TIMEOUT_SECONDS` (the agent worker crashed, got stuck, or its callback failed) is automatically marked `"timeout"`.
+
+Unlike `place_call.py`'s fixed elder-companion persona, `prompt` here becomes the agent's full instructions for that call — `helper_prompt` is appended as supplementary context, and `langage` selects the STT/TTS language.
+
+Under the hood, `create_outbound_call` dispatches the agent with a `callback_url` in the job metadata pointing back at this API. When the conversation ends, the agent's `on_session_end` callback (in `agent.py`) summarizes `session.history` with a separate, tool-forced LLM call and POSTs the structured result to that URL, which updates the stored call record for the next `GET /calls/<call_id>` to pick up. Because that callback needs to reach this API's process, set `CALLBACK_BASE_URL` in `.env` (or the agent worker's environment) to wherever this API is actually reachable — the default `http://localhost:8000` only works when both processes share a host, which won't be true once the agent worker is deployed separately (for example, via `lk agent create`).
 
 ### What's not covered here
 
 - **Inbound calls** (someone calls your Twilio number and reaches the agent) need an inbound SIP trunk and a [dispatch rule](https://docs.livekit.io/sip/dispatch-rule/) instead of explicit dispatch — see [Accepting inbound calls](https://docs.livekit.io/sip/accepting-calls/).
-- **Restart resilience / multiple API processes** — `api.py` tracks in-flight calls in an in-memory dict, so a restart loses them and it only works behind a single process. Move `_pending_calls` to a shared store (Redis, a database) if you need either.
+- **Restart resilience / multiple API processes** — `api.py` tracks call status in an in-memory dict, so a restart loses in-flight calls and it only works behind a single process. Move `_calls` to a shared store (Redis, a database) if you need either.
+- **Webhooks** — the caller has to poll `GET /calls/<call_id>` today; POSTing the result to a caller-supplied webhook URL instead would be a natural next step if polling doesn't fit your integration.
+
+## Language support
+
+The agent supports **English, Bengali (Bangla), Spanish, Arabic and Malay**. The
+language is fixed for the whole call and comes from the `langage` field on
+`POST /calls/outbound`. Short codes (`bn`), locales (`bn-BD`) and English names
+(`bengali`) are all accepted; anything else is rejected with a `400` rather than
+silently downgraded to English.
+
+Everything a language needs lives in one row of `LANGUAGES` in
+`src/languages.py`: its STT locale, its recognition model, the opening line
+spoken on answer, and the English name used to steer the LLM. The persona
+instructions themselves stay in English on purpose — the model follows them
+fine, and one reviewable persona beats five translations that drift apart.
+
+> The bundled greetings were written to match the English one's tone. **Have a
+> native speaker review them before real calls** — it is the first thing an
+> elderly person hears. Override per call with the `greeting` field.
+
+### What each part of the pipeline covers
+
+| | en | es | ar | bn | ms |
+|---|---|---|---|---|---|
+| **STT** — Google `latest_long` (v1, streaming) | ✅ | ✅ | — | ❌ | ❌ |
+| **STT** — Google `default` (v1, VAD-segmented) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Google `chirp_2` (v2) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — ElevenLabs `scribe_v2_realtime` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **LLM** — Gemini 2.5 Flash | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **TTS** — Gemini (infers language from text) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Turn detector** — `inference.TurnDetector` | ✅ | ✅ | ✅ | ❌ | ❌ |
+
+### Streaming vs VAD-segmented recognition
+
+Confirmed on a live Bengali call: Google's **v1 streaming** recognizer returned
+no interim and no final result for the entire call, then delivered the whole
+minute of speech as one transcript the moment the caller hung up. The agent had
+nothing to answer for the whole call — from the caller's side, it simply never
+responded.
+
+So `bn`, `ms` and `ar` set `google_stt_streaming=False`. That does **not**
+disable transcription: the plugin advertises itself as non-streaming, and the
+framework wraps it in `stt.StreamAdapter`, which uses the session's Silero VAD
+to cut audio into utterances and recognizes each one as it ends. Recognition
+starts after the person stops talking rather than while they speak — slower,
+but it produces a turn, which streaming here did not. `en` and `es` stay on
+streaming `latest_long`.
+
+The worker says which mode it picked at the start of every call:
+
+```
+using google STT for Bengali (Bangla) (bn-BD) in VAD-segmented mode ...
+```
+
+If you add an `ELEVENLABS_API_KEY`, `STT_PROVIDER_BN=elevenlabs` switches that
+language to `scribe_v2_realtime`, which is genuinely streaming and rates
+Bengali in ElevenLabs' high-accuracy tier. That is the better path once the key
+exists — it is not the default only because the key is currently empty in
+`.env.local`.
+
+**Turn detection.** The audio turn detector covers 14 languages
+(`ar de en es fr hi id it ja ko nl pt tr zh`). Bengali and Malay are not among
+them and were not on the older text model either. Those calls fall back to
+VAD-only endpointing — they work, but turn-taking is less responsive, and the
+worker logs a warning saying so at the start of each such call.
+
+### Choosing an STT provider
+
+Google is the default (`STT_PROVIDER=google`). The catch is that the plugin
+picks the API version from the *model name* —
+
+```python
+return 2 if self.model in get_args(SpeechModelsV2) else 1   # v2: telephony, chirp_2, chirp_3
+```
+
+— so `latest_long` means the **v1** API, and v1's `latest_long` does not cover
+Bengali or Malay. Those languages therefore default to the v1 `default` model,
+which has v1's widest language coverage and needs no extra setup. Per-language
+overrides: `GOOGLE_STT_MODEL_BN`, `GOOGLE_STT_MODEL_MS`, etc., or
+`GOOGLE_STT_MODEL` to change them all at once.
+
+To use **`chirp_2`** instead (best multilingual accuracy) you need three things,
+not just one:
+
+1. `speech.googleapis.com` enabled on the project — already true, or English
+   wouldn't work today.
+2. The service account granted **Cloud Speech Client** (`roles/speech.client`),
+   which is what carries `speech.recognizers.recognize` — the permission that
+   currently returns `403`.
+3. A **non-global region**. `chirp_2` is not available in `global`; it runs in
+   `us-central1`, `europe-west4` and `asia-southeast1` only, and is Private GA,
+   so access has to be requested. Set `GOOGLE_STT_LOCATION` accordingly.
+
+The alternative is **ElevenLabs** (`STT_PROVIDER=elevenlabs`), which covers all
+five languages with one model and needs no Google IAM change. Note the default
+here is now `scribe_v2_realtime` — the older `scribe_v1` is batch-only, so on a
+live call no text exists until the caller has already stopped speaking.
+
+### Voices
+
+A voice is not language-neutral: the default ElevenLabs voice is an English one
+and carries an English accent into every other language. Set a native voice per
+language with `ELEVENLABS_VOICE_ID_<CODE>` (e.g. `ELEVENLABS_VOICE_ID_BN`), or
+`GEMINI_TTS_VOICE_<CODE>` / `GOOGLE_TTS_VOICE_<CODE>` for those providers. The
+unsuffixed variables still apply as the fallback for any language without one.
+
+## Securing the completion callback
+
+`POST /internal/calls/{call_id}/completed` is how the agent worker reports a
+call's result. It is deliberately **not** in the OpenAPI schema or `/docs`:
+Swagger pre-fills string fields with `"string"`, so a single "Try it out" on it
+sends `error: "string"`, which marks a live call errored — and the worker's real
+result is then discarded as a duplicate callback.
+
+Hiding it is not access control. Set `CALLBACK_SECRET` to the same value in
+**both** the API's and the worker's environment, and the worker will send it as
+`X-Callback-Secret` while the API rejects anything else with a `401`:
+
+```bash
+CALLBACK_SECRET=$(openssl rand -hex 32)
+```
+
+Unset on both sides keeps the old unauthenticated behaviour, so nothing breaks
+if you skip this — but anyone who can reach the service and learn a `call_id`
+can otherwise finish or fail that call on the agent's behalf.
+
+## Call quality tuning (greeting latency and VAD)
+
+Two things dominate how a phone call *feels*: how fast the agent speaks after the callee picks up, and whether it reliably takes turns instead of talking over people or cutting itself off.
+
+**The opening line is spoken, not generated.** On answer the agent sends a known string straight to TTS rather than asking the LLM to compose a greeting, which removes a full model round trip from the start of every call. Precedence: `greeting` in the job metadata (the outbound call API's `greeting` field, or `place_call.py --greeting`) → the `AGENT_GREETING` environment variable → the built-in line in `agent.py`. A caller-supplied `prompt` with no `greeting` is the one case that still generates its opening line, since a fixed "calling to see how you're doing" would be wrong coming from an arbitrary persona — pass a `greeting` alongside a custom `prompt` to get the fast path back.
+
+On phone calls the greeting is also **uninterruptible**, so line noise at pickup can't kill it mid-word; anything the callee says over it (people answer with "Hello?") is kept rather than discarded, and handled as soon as the greeting finishes. Console and web sessions keep an interruptible greeting.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AGENT_GREETING` | built-in line | Opening line for the default persona |
+| `SIP_GREETING_DELAY_SECONDS` | `0.25` | Pause after answer before speaking, so a carrier that completes signalling just before the media path is live doesn't clip the first syllable |
+| `VAD_MIN_SPEECH_DURATION` | `0.15` | Speech must last this long to start a turn. Silero's stock `0.05` lets a line pop or a key click register as speech |
+| `VAD_MIN_SILENCE_DURATION` | `0.65` | Pause before a turn is considered over. Above stock, because elderly callers pause mid-thought and being cut off is worse than a slightly later reply |
+| `VAD_ACTIVATION_THRESHOLD` | `0.6` | Above stock `0.5`, which fires on a phone line's noise floor |
+| `VAD_DEACTIVATION_THRESHOLD` | `0.35` | Deliberately far below activation. This hysteresis band keeps a turn alive through the quiet dips inside normal speech instead of flickering |
+| `VAD_PREFIX_PADDING_DURATION` | `0.5` | Audio kept from just before detection so STT hears the word onset |
+| `VAD_SAMPLE_RATE` | `16000` | Silero also ships an 8kHz variant matching telephony's native rate; a phone-only deployment can try `8000` |
+| `INTERRUPTION_MIN_WORDS` | `1` | Words that must actually transcribe before the agent stops talking. The stock `0` means any accepted burst of audio — a television, a cough — cuts it off |
+| `INTERRUPTION_MIN_DURATION` | `0.6` | Minimum overlapping speech length to count as an interruption |
+| `PREEMPTIVE_TTS` | `1` | Synthesise before the turn is confirmed. Cuts latency, but wastes synthesis on false starts — set `0` first if calls still sound unstable after retuning the VAD |
+
+Retune against real call recordings rather than by feel: raise `VAD_ACTIVATION_THRESHOLD` and `VAD_MIN_SPEECH_DURATION` if the agent takes turns nobody started, and lower them if it misses quiet speakers.
 
 ## Customize your agent
 
@@ -402,17 +568,32 @@ If you don't alread have a frontend, use the following templates and guides to g
 
 ## Observability
 
-LiveKit provides deep session insights for your agents through [Agent Observability](https://docs.livekit.io/deploy/observability/). Monitor conversation quality, track latency metrics, and debug agent behavior in production.
+LiveKit provides deep session insights for your agents through [Agent Observability](https://docs.livekit.io/deploy/observability/). Monitor conversation quality, track latency metrics, and debug agent behavior in production. That covers the voice pipeline itself; the outbound-call API (`src/api.py`) is a separate service with its own observability:
+
+- **Metrics**: `GET /metrics` on the API exposes Prometheus-format counters/histograms (`avery_calls_created_total`, `avery_calls_completed_total{status=...}`, `avery_call_duration_seconds`) — point a Prometheus instance (self-hosted, or a SaaS like Grafana Cloud) at it. Nothing to configure; the endpoint is always on.
+- **Tracing**: set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OpenTelemetry traces for the call-dispatch lifecycle to any OTLP-compatible collector (self-hosted Jaeger/Tempo/Grafana, or a SaaS). Unset, tracing is a no-op — this is opt-in, not a new requirement.
+- **Logs**: both `agent.py` and `api.py` log plain text by default. Set `LOG_FORMAT=json` in a deployment's environment for structured, one-JSON-object-per-line logs (see `src/logging_utils.py`) — useful for correlating a call across both processes by `call_id`, or feeding a log aggregator.
+
+None of the above requires a new purchase: Prometheus, an OTLP collector, and JSON log shipping can all be run yourself for free. They're also all designed to work with a paid/hosted equivalent (Grafana Cloud, Datadog, Honeycomb, etc.) if you'd rather not run the infrastructure — that's an operational choice, not something this code assumes either way.
 
 ## Deploy to production
 
-To deploy your agent to production, you can use the LiveKit CLI:
+**Agent worker** (`src/agent.py`) — use the LiveKit CLI:
 
 ```console
 lk agent create
 ```
 
 See the [deploying to production](https://docs.livekit.io/deploy/agents/) guide for detailed instructions and optimization tips.
+
+**Outbound call API** (`src/api.py`) — this is a separate service from the agent worker and isn't covered by `lk agent create`. Build it from the Dockerfile's dedicated `api` stage (a plain `docker build .` still builds the agent worker unchanged, as before):
+
+```console
+docker build --target api -t avery-api .
+docker run --env-file .env.local -p 8000:8000 avery-api
+```
+
+Deploy the resulting image anywhere that runs a container (it's a standard stateless FastAPI/uvicorn service) — a VM, ECS/Cloud Run/Fly.io/Render, or your existing container platform. It needs `LIVEKIT_URL`/`LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` and `CALLBACK_BASE_URL` set to wherever it's actually reachable from the agent worker; see the "Outbound Phone Calls" section above for the rest of its configuration.
 
 ## Join the LiveKit community
 

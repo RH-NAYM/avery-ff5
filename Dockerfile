@@ -71,9 +71,9 @@ RUN uv run --module livekit.agents download-files
 # (Excludes files specified in .dockerignore)
 COPY . .
 
-# --- Production stage ---
-# Build tools (gcc, g++, python3-dev) are not included in the final image
-FROM base
+# --- Runtime user, shared by both stages below ---
+# Build tools (gcc, g++, python3-dev) are not included in the final images.
+FROM base AS runtime
 
 # Create a non-privileged user that the app will run under.
 # See https://docs.docker.com/build/building/best-practices/#user
@@ -85,6 +85,32 @@ RUN adduser \
     --shell "/sbin/nologin" \
     --uid "${UID}" \
     appuser
+
+# --- API stage (src/api.py) ---
+# The outbound-call trigger service -- see the "Outbound Phone Calls" and
+# "Deploy to production" sections in README.md. It shares the exact same
+# dependencies/venv as the agent worker below (fastapi/uvicorn are already
+# installed in the "build" stage), so this just points CMD at uvicorn
+# instead. Build it explicitly, since a plain `docker build .` (no
+# --target) keeps building the agent worker unchanged, as it always has:
+#   docker build --target api -t avery-api .
+#   docker run --env-file .env.local -p 8000:8000 avery-api
+FROM runtime AS api
+
+COPY --from=build --chown=appuser:appuser /app /app
+
+WORKDIR /app
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uv", "run", "uvicorn", "api:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000"]
+
+# --- Agent worker stage (src/agent.py) ---
+# This is the default target (it's the LAST stage in this file, and Docker
+# builds the last stage when no --target is given), so `docker build .`
+# behaves exactly as it always has.
+FROM runtime AS agent
 
 # Copy the application and virtual environment with correct ownership in a single layer
 # This avoids expensive recursive chown and excludes build tools from the final image

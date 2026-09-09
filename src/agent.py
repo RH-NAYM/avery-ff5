@@ -1,7 +1,10 @@
+import asyncio
 import json
 import logging
 import os
 import tempfile
+from dataclasses import dataclass, field
+from typing import Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -19,6 +22,8 @@ from livekit.agents import (
     JobProcess,
     TurnHandlingOptions,
     cli,
+    function_tool,
+    inference,
     room_io,
 )
 from livekit.plugins import (
@@ -30,8 +35,20 @@ from livekit.plugins import (
     silero,
 )
 from livekit.plugins.google.beta import GeminiTTS
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+from languages import (
+    DEFAULT_LANGUAGE,
+    LANGUAGES,
+    TURN_DETECTOR_LANGUAGES,
+    LanguageProfile,
+    resolve_language,
+)
+from logging_utils import configure_logging
+
+# Structured (JSON) logs when LOG_FORMAT=json is set in the environment
+# (e.g. a production deployment); plain text otherwise, including LiveKit's
+# own colored `console`/`dev` CLI output, which this leaves untouched.
+configure_logging()
 logger = logging.getLogger("agent-Avery-ff5")
 
 load_dotenv(".env.local")  # local dev config, per README (git-ignored)
@@ -90,12 +107,167 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _build_stt(language: str = "en"):
-    provider = os.environ.get("STT_PROVIDER", "google").lower()
+def _env_float(name: str, default: float) -> float:
+    """Read a float tuning knob from the environment, falling back to the
+    default (with a warning) rather than crashing the worker on a typo."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r, using %s", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int, *, allowed: tuple[int, ...] | None = None) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r, using %s", name, raw, default)
+        return default
+    if allowed is not None and value not in allowed:
+        logger.warning(
+            "ignoring out-of-range %s=%r (allowed: %s), using %s",
+            name,
+            raw,
+            allowed,
+            default,
+        )
+        return default
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Fixed opening line for the built-in elder-companion persona, spoken
+# straight to TTS on answer (see DefaultAgent.on_enter). Sending a known
+# string to TTS instead of asking the LLM to compose a greeting removes an
+# entire model round trip from the moment the callee picks up -- the
+# difference between a voice starting almost immediately and one to two
+# seconds of dead air while someone is holding a phone to their ear
+# wondering if anyone is there.
+#
+# Override per call with `greeting` in the job metadata, or globally with
+# the AGENT_GREETING environment variable. The per-language defaults live in
+# LANGUAGES below; AGENT_GREETING, if set, wins for every language, so only
+# set it in a single-language deployment.
+AGENT_GREETING_OVERRIDE = os.environ.get("AGENT_GREETING") or None
+
+# Kept as a module-level name for the English default specifically; every
+# other language reads its own greeting off its profile.
+DEFAULT_GREETING = AGENT_GREETING_OVERRIDE or LANGUAGES["en"].greeting
+
+
+def resolve_turn_detection(profile: LanguageProfile):
+    """The turn detector for this language, or None to fall back to VAD.
+
+    The audio turn detector covers 14 languages; Bengali and Malay are not
+    among them, and neither were they on the older text model this replaced.
+    Handing it an unsupported language isn't an error -- it just quietly stops
+    contributing, and turns commit on the endpointing delay alone. That is a
+    real difference in how the call feels, so it gets said out loud once per
+    call rather than being discovered later from a transcript.
+    """
+    if profile.code not in TURN_DETECTOR_LANGUAGES:
+        logger.warning(
+            "no turn-detector support for %s (%s); falling back to VAD-only "
+            "endpointing, which makes turn-taking less responsive on this call",
+            profile.name,
+            profile.code,
+        )
+        return None
+    return inference.TurnDetector()
+
+
+def _google_stt_model(profile: LanguageProfile) -> str:
+    """Per-language model, overridable globally (GOOGLE_STT_MODEL) or per
+    language (GOOGLE_STT_MODEL_BN, ...). The per-language form is what you
+    want once one language is moved onto chirp_2 and the others aren't."""
+    per_language = os.environ.get(f"GOOGLE_STT_MODEL_{profile.code.upper()}")
+    if per_language:
+        return per_language
+    return os.environ.get("GOOGLE_STT_MODEL") or profile.google_stt_model
+
+
+# Seconds to wait after the callee answers before speaking. A carrier can
+# complete SIP signalling (which is what wait_until_answered=True waits for)
+# slightly before the RTP media path is actually carrying audio, and anything
+# spoken in that window gets clipped -- classically the first syllable of the
+# greeting. A short settle delay costs far less than a caller hearing
+# "...there, it's Avery". Only applied to phone calls; console/web sessions
+# use 0.
+SIP_GREETING_DELAY = _env_float("SIP_GREETING_DELAY_SECONDS", 0.25)
+
+# --- End-of-call reporting budget ------------------------------------------
+# on_session_end() runs inside the worker's own session_end_timeout (300s by
+# default in livekit-agents 1.7). Overrun it and the SDK abandons the callback
+# entirely -- nothing is posted back, so the outbound call API sits "pending"
+# until CALL_TIMEOUT_SECONDS and then reports a timeout with no summary. That
+# is the single worst outcome here, so everything on that path is bounded to
+# finish well inside it: one summary attempt (45s) plus every callback retry
+# (4 x 10s + 7s of backoff) is ~92s, leaving a wide margin.
+SUMMARY_TIMEOUT_SECONDS = _env_float("SUMMARY_TIMEOUT_SECONDS", 45.0)
+CALLBACK_TIMEOUT_SECONDS = _env_float("CALLBACK_TIMEOUT_SECONDS", 10.0)
+CALLBACK_MAX_ATTEMPTS = _env_int("CALLBACK_MAX_ATTEMPTS", 4)
+CALLBACK_BACKOFF_SECONDS = _env_float("CALLBACK_BACKOFF_SECONDS", 1.0)
+
+# Must match CALLBACK_SECRET on the outbound call API when that side sets one.
+# Unset on both sides means the callback is unauthenticated, which is the old
+# behaviour.
+CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET") or None
+
+
+def _resolve_stt_provider(profile: LanguageProfile) -> str:
+    """Which STT provider serves this language.
+
+    Precedence: an explicit per-language override, then the language's own
+    pinned provider, then the global default. The pin beats STT_PROVIDER on
+    purpose -- a language pinned here is one the global provider was observed
+    to fail on, and silently honouring STT_PROVIDER would just reproduce the
+    failure (an agent that never answers) on every call in that language.
+    """
+    override = os.environ.get(f"STT_PROVIDER_{profile.code.upper()}")
+    if override:
+        return override.lower()
+    if profile.stt_provider:
+        return profile.stt_provider.lower()
+    return os.environ.get("STT_PROVIDER", "google").lower()
+
+
+def _build_stt(profile: LanguageProfile):
+    provider = _resolve_stt_provider(profile)
+    logger.info(
+        "using %s STT for %s (%s)%s",
+        provider,
+        profile.name,
+        profile.bcp47,
+        ""
+        if provider != "google" or profile.google_stt_streaming
+        else " in VAD-segmented mode (streaming recognition is unreliable for "
+        "this language, see LanguageProfile.google_stt_streaming)",
+    )
     if provider == "elevenlabs":
+        # scribe_v2_realtime is the streaming model; the older scribe_v1 is
+        # batch-only, which on a live call means waiting for an utterance to
+        # end before any text exists. Scribe also covers all five supported
+        # languages, which is why it's the fallback when Google's model for a
+        # language isn't available -- see README's "Language support".
         return elevenlabs.STT(
             api_key=_require_env("ELEVENLABS_API_KEY"),
-            model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1"),
+            model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2_realtime"),
+            # ISO-639 here, not the BCP-47 locale: ElevenLabs takes a bare
+            # language code and would reject "bn-BD". Google is the opposite --
+            # region genuinely changes the recognition target there.
+            language_code=profile.code,
         )
     if provider == "google":
         # Google Cloud Speech-to-Text, authenticated with a service account
@@ -113,7 +285,21 @@ def _build_stt(language: str = "en"):
         # is what your service account is actually provisioned for.
         return google.STT(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
-            model=os.environ.get("GOOGLE_STT_MODEL", "latest_long"),
+            model=_google_stt_model(profile),
+            # Without this the plugin uses its own "en-US" default, which is
+            # what made every call transcribe as English regardless of the
+            # language requested.
+            languages=profile.bcp47,
+            # The language is fixed per call by the API contract, so lock the
+            # recognizer to it instead of letting it hunt -- detection costs
+            # accuracy, and there is nothing to detect when we already know.
+            detect_language=False,
+            location=os.environ.get("GOOGLE_STT_LOCATION", "global"),
+            # False here doesn't disable transcription -- it makes the
+            # framework segment audio with VAD and recognize each utterance as
+            # it ends, instead of trusting a streaming recognizer that (for
+            # some languages) returns nothing until the call is over.
+            use_streaming=profile.google_stt_streaming,
         )
     raise ValueError(
         f"Unknown STT_PROVIDER: {provider!r} (expected 'elevenlabs' or 'google')"
@@ -151,24 +337,38 @@ def _build_llm():
     )
 
 
-def _build_tts(language: str = "en"):
+def _build_tts(profile: LanguageProfile):
     provider = os.environ.get("TTS_PROVIDER", "elevenlabs").lower()
     if provider == "elevenlabs":
+        # A voice is not language-neutral: the default voice is an English
+        # one, and it carries an English accent into every other language.
+        # ELEVENLABS_VOICE_ID_<CODE> picks a native voice per language.
+        voice_id = os.environ.get(
+            f"ELEVENLABS_VOICE_ID_{profile.code.upper()}"
+        ) or os.environ.get("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us")
         return elevenlabs.TTS(
-            voice_id=os.environ.get("ELEVENLABS_VOICE_ID", "hpp4J3VqNfWAUOO0d1Us"),
+            voice_id=voice_id,
             model=os.environ.get("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5"),
             api_key=_require_env("ELEVENLABS_API_KEY"),
-            language=language,
+            language=profile.code,
             # Lets the <break time="..."/> tags in DefaultAgent's instructions
             # (see _supports_ssml_breaks) render as actual pauses instead of
             # being read aloud.
             enable_ssml_parsing=True,
         )
     if provider == "gemini":
+        # Gemini TTS has no language parameter -- it infers the language from
+        # the text it is handed, and covers all five supported languages that
+        # way. That makes the greeting load-bearing: hand it an English
+        # opening line on a Bengali call and the first thing the callee hears
+        # is an English voice. See LANGUAGES above.
         gemini_tts_api_key = os.environ.get("GEMINI_API_KEY")
+        gemini_voice = os.environ.get(
+            f"GEMINI_TTS_VOICE_{profile.code.upper()}"
+        ) or os.environ.get("GEMINI_TTS_VOICE", "Kore")
         if gemini_tts_api_key:
             return GeminiTTS(
-                voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
+                voice_name=gemini_voice,
                 api_key=gemini_tts_api_key,
             )
         # No API key: fall back to Vertex AI using a Google Cloud service
@@ -177,14 +377,14 @@ def _build_tts(language: str = "en"):
         # project is inferred from the service account key file and the
         # location defaults to "us-central1" if not set.
         return GeminiTTS(
-            voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
+            voice_name=gemini_voice,
             vertexai=True,
         )
     if provider == "cartesia":
         return cartesia.TTS(
             model="sonic-3",
             voice="a167e0f3-df7e-4d52-a9c3-f949145efdab",
-            language=language,
+            language=profile.code,
             api_key=_require_env("CARTESIA_API_KEY"),
         )
     if provider == "google":
@@ -194,7 +394,10 @@ def _build_tts(language: str = "en"):
         # own TTS model instead of the Cloud Text-to-Speech API.
         return google.TTS(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
-            voice_name=os.environ.get("GOOGLE_TTS_VOICE") or NOT_GIVEN,
+            language=profile.bcp47,
+            voice_name=os.environ.get(f"GOOGLE_TTS_VOICE_{profile.code.upper()}")
+            or os.environ.get("GOOGLE_TTS_VOICE")
+            or NOT_GIVEN,
         )
     if provider == "coqui":
         # Local import: torch/coqui-tts are heavy, GPU-oriented dependencies
@@ -226,7 +429,7 @@ def _supports_ssml_breaks() -> bool:
     )
 
 
-def _voice_realism_instructions(language: str = "en") -> str:
+def _voice_realism_instructions(profile: LanguageProfile) -> str:
     """Output-formatting and speech-pacing rules shared by every persona
     (the hardcoded default and any dynamically supplied `prompt`), so a
     caller-supplied prompt still gets short, natural, phone-call-paced
@@ -256,9 +459,14 @@ def _voice_realism_instructions(language: str = "en") -> str:
             * Good: "Hmm, that sounds like it was a good afternoon."
             """
     )
+    # Named, not coded: "Speak only in Bengali (Bangla)" steers a model far
+    # better than "Speak only in bn". The instructions themselves stay in
+    # English on purpose -- the model follows them fine and it keeps one
+    # reviewable copy of the persona rather than five translations that drift.
     language_line = (
-        f"* Speak only in {language}, regardless of what language this prompt is written in.\n"
-        if language.lower() not in ("en", "en-us", "english")
+        f"* Speak only in {profile.name}, regardless of what language this prompt is written in. "
+        f"This applies to every single turn, including the first one and any numbers, dates or names you say.\n"
+        if profile.code != DEFAULT_LANGUAGE
         else ""
     )
     return f"""
@@ -290,7 +498,11 @@ class DefaultAgent(Agent):
         prompt: str | None = None,
         helper_prompt: str | None = None,
         language: str = "en",
+        greeting: str | None = None,
+        greeting_delay: float = 0.0,
+        greeting_interruptible: bool = True,
     ) -> None:
+        profile = resolve_language(language)
         if prompt:
             # Caller-supplied persona (see the outbound call API in api.py):
             # `prompt` is the full identity/goal instructions, `helper_prompt`
@@ -299,7 +511,7 @@ class DefaultAgent(Agent):
             sections = [prompt.strip()]
             if helper_prompt and helper_prompt.strip():
                 sections.append(f"# Additional context\n\n{helper_prompt.strip()}")
-            sections.append(_voice_realism_instructions(language))
+            sections.append(_voice_realism_instructions(profile))
             instructions = "\n\n".join(sections)
         else:
             instructions = f"""You are a warm, caring family companion speaking with an elderly parent on behalf of their son or daughter.
@@ -313,7 +525,7 @@ class DefaultAgent(Agent):
                 * Feel free to start sentences with "And", "But", or "So", the way people do when talking, not writing.
                 * Reference something they said earlier loosely ("about what you mentioned a minute ago") rather than quoting it back verbatim.
 
-                {_voice_realism_instructions(language)}
+                {_voice_realism_instructions(profile)}
 
                 Conversation goals:
 
@@ -356,12 +568,91 @@ class DefaultAgent(Agent):
                 * End with warmth and encouragement.
                 """
         super().__init__(instructions=instructions)
+        self._profile = profile
+        self._greeting = greeting
+        self._greeting_delay = greeting_delay
+        self._greeting_interruptible = greeting_interruptible
+        self._custom_persona = bool(prompt)
 
-    async def on_enter(self):
+    def resolve_greeting(self) -> str | None:
+        """The exact line to speak on answer, or None to have the LLM compose
+        one instead.
+
+        A caller-supplied persona (the outbound call API's `prompt`) gets no
+        fixed default: "it's Avery calling to see how you're doing" would be
+        wrong coming from an arbitrary persona, so unless that caller also
+        supplies its own `greeting`, the opening line is generated. The
+        built-in elder-companion persona always has a fixed line available,
+        which is the case that benefits most from skipping the LLM.
+        """
+        if self._greeting:
+            return self._greeting
+        if self._custom_persona:
+            return None
+        # Per-language, so a Bengali call opens in Bengali. AGENT_GREETING,
+        # if set, overrides every language at once.
+        return AGENT_GREETING_OVERRIDE or self._profile.greeting
+
+    async def on_enter(self) -> None:
+        if self._greeting_delay > 0:
+            await asyncio.sleep(self._greeting_delay)
+
+        greeting = self.resolve_greeting()
+        if greeting:
+            # Straight to TTS -- no LLM round trip, so audio starts as soon
+            # as the first synthesis chunk lands rather than after a full
+            # generate/synthesize cycle.
+            await self.session.say(
+                greeting, allow_interruptions=self._greeting_interruptible
+            )
+            return
+
         await self.session.generate_reply(
-            instructions="""Greet the user and offer your assistance.""",
+            instructions=(
+                "Greet the person warmly and briefly say why you're calling."
+            ),
             allow_interruptions=True,
         )
+
+    @function_tool
+    async def begin_wrap_up(self) -> Agent:
+        """Call this once, and only once, when the conversation has run its
+        natural course and it's time to say goodbye -- for example once the
+        person has shared how they're doing and there's no new ground left
+        to cover, or if they signal they want to end the call. Do not call
+        this early or in the middle of the conversation.
+        """
+        return ClosingAgent(language=self._profile.code)
+
+
+class ClosingAgent(Agent):
+    """Dedicated closing phase, entered via DefaultAgent.begin_wrap_up().
+
+    Kept as its own Agent/task rather than folded into DefaultAgent's single
+    instructions block -- see AGENTS.md's guidance to use handoffs/tasks for
+    distinct conversation phases instead of one long prompt covering all of
+    them. This is the phase boundary most worth a hard structural trigger:
+    whether a call is *ending* shouldn't depend on the model inferring it
+    from prose alone, and this applies to both the default persona and any
+    caller-supplied `prompt` (see api.py), since begin_wrap_up() is defined
+    on DefaultAgent itself rather than tucked inside persona-specific text.
+    """
+
+    def __init__(self, *, language: str = "en") -> None:
+        profile = resolve_language(language)
+        instructions = f"""The conversation is ending now -- you're wrapping up the call.
+
+            * In one or two sentences, warmly note how the person seems to be doing today.
+            * If something notable came up (mood, health, an activity they mentioned), you can mention it briefly -- only if it's relevant, don't force it.
+            * Thank them and say goodbye the way a caring family member would, not a script. Vary your wording -- don't reuse the same sign-off every call.
+            * Do not ask any new questions. The conversation is over; this is the last thing you say.
+
+            {_voice_realism_instructions(profile)}
+            """
+        super().__init__(instructions=instructions)
+
+    async def on_enter(self) -> None:
+        await self.session.generate_reply(allow_interruptions=True)
 
 
 def _parse_dial_info(ctx: JobContext) -> dict:
@@ -373,34 +664,142 @@ def _parse_dial_info(ctx: JobContext) -> dict:
     if not ctx.job.metadata:
         return {}
     try:
-        return json.loads(ctx.job.metadata)
+        metadata = json.loads(ctx.job.metadata)
     except json.JSONDecodeError:
         logger.warning("ignoring non-JSON job metadata: %r", ctx.job.metadata)
         return {}
+    if not isinstance(metadata, dict):
+        # Valid JSON of the wrong shape (a bare string, a list). Everything
+        # downstream calls .get() on this, so reject it at the trust boundary
+        # rather than dying with an AttributeError halfway through a call.
+        logger.warning("ignoring non-object job metadata: %r", ctx.job.metadata)
+        return {}
+    return metadata
 
 
-async def _post_callback(callback_url: str, payload: dict) -> None:
-    """Best-effort POST back to the outbound call API (see api.py) so it can
-    return a response to its caller instead of blocking until its timeout.
-    Never raises: a failed callback should not crash the job."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(callback_url, json=payload)
-            response.raise_for_status()
-    except httpx.HTTPError:
-        logger.exception("failed to post call-completed callback to %s", callback_url)
+async def _post_callback(callback_url: str, payload: dict) -> bool:
+    """POST a call's result back to the outbound call API (see api.py).
+
+    This is the only moment that result exists: it was just built from an
+    in-memory transcript, in a worker process that is already shutting down,
+    and nothing re-derives it afterwards. So a dropped request doesn't delay
+    the result, it destroys it -- the API stays "pending" until
+    CALL_TIMEOUT_SECONDS and then reports a timeout with no summary, which
+    looks identical to a call that never happened. CALLBACK_BASE_URL commonly
+    points at a tunnel or a single-process service that can blip for a second,
+    so transient failures are retried with exponential backoff instead of
+    being logged and forgotten.
+
+    Never raises: a failed callback should not crash the job. Returns whether
+    the API accepted the result.
+    """
+    call_id = payload.get("call_id")
+    backoff = CALLBACK_BACKOFF_SECONDS
+    reason = "unknown"
+
+    for attempt in range(1, CALLBACK_MAX_ATTEMPTS + 1):
+        try:
+            headers = (
+                {"X-Callback-Secret": CALLBACK_SECRET} if CALLBACK_SECRET else None
+            )
+            async with httpx.AsyncClient(timeout=CALLBACK_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    callback_url, json=payload, headers=headers
+                )
+                response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code < 500:
+                # The API understood the request and refused it -- an unknown
+                # call_id, or a body it can't parse. Retrying cannot change
+                # the answer, and this job is holding up its own shutdown.
+                logger.error(
+                    "call-completed callback to %s rejected with HTTP %s; not retrying",
+                    callback_url,
+                    exc.response.status_code,
+                    extra={"call_id": call_id},
+                )
+                return False
+            reason = f"HTTP {exc.response.status_code}"
+        except httpx.HTTPError as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+
+        if attempt < CALLBACK_MAX_ATTEMPTS:
+            logger.warning(
+                "call-completed callback to %s failed (%s), attempt %d/%d, retrying in %.1fs",
+                callback_url,
+                reason,
+                attempt,
+                CALLBACK_MAX_ATTEMPTS,
+                backoff,
+                extra={"call_id": call_id},
+            )
+            await asyncio.sleep(backoff)
+            backoff *= 2
+
+    logger.error(
+        "giving up on the call-completed callback to %s after %d attempts (%s); "
+        "this call's result is lost and the API will report it as a timeout",
+        callback_url,
+        CALLBACK_MAX_ATTEMPTS,
+        reason,
+        extra={"call_id": call_id},
+    )
+    return False
 
 
-async def summarize_session(summarizer, chat_ctx: ChatContext) -> str | None:
-    """Generate a brief summary of the user/assistant turns using a separate,
-    non-conversational LLM call. Based on the "Summarizing context" pattern
-    in the LiveKit Agents docs (agents/logic/agents-handoffs)."""
+@dataclass
+class CallSummary:
+    """Structured result of summarize_session(), so a backend can branch on
+    `concern_level` programmatically instead of a human re-reading prose to
+    notice something urgent (see api.py's /calls/outbound response and the
+    /internal/calls/{call_id}/completed callback payload)."""
+
+    text: str
+    concern_level: Literal["none", "watch", "urgent"] = "none"
+    flagged_topics: list[str] = field(default_factory=list)
+
+
+@function_tool(name="record_call_summary")
+async def _record_call_summary(
+    summary: str,
+    concern_level: Literal["none", "watch", "urgent"],
+    flagged_topics: list[str],
+) -> None:
+    """Record a structured summary of the phone conversation for a business record.
+
+    Args:
+        summary: 2-4 factual, concise sentences summarizing what was discussed.
+        concern_level: "urgent" if the caller disclosed something needing
+            prompt human attention (an injury, a medical emergency, a safety
+            concern, or severe distress). "watch" for a minor or ambiguous
+            concern worth a caregiver's attention but not urgent (a mild
+            symptom, low mood, a medication question). "none" for a routine,
+            unremarkable call.
+        flagged_topics: short topic tags for anything concerning that was
+            raised (for example "fall", "chest pain", "loneliness"). Leave
+            empty if concern_level is "none".
+    """
+    # This function is never actually executed -- summarize_session() below
+    # reads the tool call's arguments directly instead of running this body.
+    # It exists purely to give the LLM a schema to call into, forcing a
+    # structured response instead of free text.
+    return None
+
+
+async def summarize_session(summarizer, chat_ctx: ChatContext) -> CallSummary | None:
+    """Generate a structured summary of the user/assistant turns using a
+    separate, non-conversational LLM call that's forced to report through
+    the `record_call_summary` tool instead of free text. Based on the
+    "Summarizing context" pattern in the LiveKit Agents docs
+    (agents/logic/agents-handoffs), extended with tool-calling so the result
+    is machine-actionable, not just human-readable."""
     summary_ctx = ChatContext()
     summary_ctx.add_message(
         role="system",
         content=(
             "Summarize the following phone conversation for a business "
-            "record. Be factual and concise, 2-4 sentences."
+            "record by calling record_call_summary exactly once."
         ),
     )
 
@@ -408,16 +807,41 @@ async def summarize_session(summarizer, chat_ctx: ChatContext) -> str | None:
     for item in chat_ctx.items:
         if item.type != "message" or item.role not in ("user", "assistant"):
             continue
-        text = (item.text_content or "").strip()
-        if text:
-            summary_ctx.add_message(role="user", content=f"{item.role}: {text}")
+        item_text = (item.text_content or "").strip()
+        if item_text:
+            summary_ctx.add_message(role="user", content=f"{item.role}: {item_text}")
             n_summarized += 1
 
     if n_summarized == 0:
         return None
 
-    response = await summarizer.chat(chat_ctx=summary_ctx).collect()
-    return response.text.strip() if response.text else None
+    response = await summarizer.chat(
+        chat_ctx=summary_ctx,
+        tools=[_record_call_summary],
+        tool_choice="required",
+    ).collect()
+
+    for call in response.tool_calls:
+        if call.name != "record_call_summary":
+            continue
+        try:
+            args = json.loads(call.arguments)
+            return CallSummary(
+                text=str(args["summary"]).strip(),
+                concern_level=args.get("concern_level", "none"),
+                flagged_topics=list(args.get("flagged_topics") or []),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.exception(
+                "failed to parse record_call_summary arguments: %r", call.arguments
+            )
+            break
+
+    # The model didn't call the tool as instructed, or returned malformed
+    # arguments. Fall back to whatever free text came back rather than
+    # losing the summary entirely.
+    fallback_text = response.text.strip() if response.text else None
+    return CallSummary(text=fallback_text) if fallback_text else None
 
 
 async def on_session_end(ctx: JobContext) -> None:
@@ -429,30 +853,119 @@ async def on_session_end(ctx: JobContext) -> None:
         # or a call placed via place_call.py) -- nothing to report back.
         return
 
-    session = ctx.primary_session
-    if session is None:
+    # JobContext.primary_session *raises* when no AgentSession was ever
+    # started -- it does not return None (livekit-agents 1.7, job.py). An
+    # unhandled raise here is silent: the worker catches it, logs it and moves
+    # on, so nothing is posted back at all and the API sits "pending" until
+    # CALL_TIMEOUT_SECONDS before reporting a timeout with no summary. Report
+    # the failure instead, immediately.
+    try:
+        session = ctx.primary_session
+    except RuntimeError:
+        logger.warning(
+            "no agent session was started for call %s",
+            call_id,
+            extra={"call_id": call_id},
+        )
         await _post_callback(
             callback_url, {"call_id": call_id, "error": "session never started"}
         )
         return
 
+    # The worker calls aclose() on the session *before* invoking this, which
+    # is fine to summarize from: session.history and session.llm are plain
+    # attributes that outlive the close, and only the live audio activity is
+    # torn down. It does mean nothing can rescue this if the summarizer
+    # stalls, though -- and a stall that outlasts the worker's
+    # session_end_timeout kills the callback with it -- hence the hard bound.
+    summary: CallSummary | None = None
+    summary_error: str | None = None
     try:
-        summary = await summarize_session(session.llm, session.history)
-    except Exception:
-        logger.exception("failed to summarize session for call %s", call_id)
-        summary = None
+        summary = await asyncio.wait_for(
+            summarize_session(session.llm, session.history),
+            timeout=SUMMARY_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        summary_error = (
+            f"summary generation timed out after {SUMMARY_TIMEOUT_SECONDS:g}s"
+        )
+        logger.error(
+            "summary generation timed out for call %s after %.1fs",
+            call_id,
+            SUMMARY_TIMEOUT_SECONDS,
+            extra={"call_id": call_id},
+        )
+    except Exception as exc:
+        summary_error = f"summary generation failed: {exc}"
+        logger.exception(
+            "failed to summarize session for call %s",
+            call_id,
+            extra={"call_id": call_id},
+        )
 
-    await _post_callback(
-        callback_url, {"call_id": call_id, "response_summary": summary or ""}
+    payload: dict = {"call_id": call_id}
+    if summary_error is not None:
+        # Deliberately not reported as a completed call carrying an empty
+        # summary and concern_level "none". On a wellbeing check-in those mean
+        # "nothing came up"; a failed summary means "we don't know what came
+        # up". Collapsing the second into the first is how an urgent call ends
+        # up indistinguishable from a chat about the garden.
+        payload["error"] = summary_error
+    else:
+        payload["response_summary"] = summary.text if summary else ""
+        payload["concern_level"] = summary.concern_level if summary else "none"
+        payload["flagged_topics"] = summary.flagged_topics if summary else []
+
+    logger.info(
+        "call %s ended, concern_level=%s",
+        call_id,
+        payload.get("concern_level", "unknown"),
+        extra={"call_id": call_id},
     )
+    await _post_callback(callback_url, payload)
 
 
 def prewarm(proc: JobProcess) -> None:
     """Load the VAD model once per worker process instead of once per call.
     Without this, entrypoint() would call silero.VAD.load() fresh on every
     single job, paying ONNX model init time before the agent can start
-    listening -- on the critical path of every call's setup latency."""
-    proc.userdata["vad"] = silero.VAD.load()
+    listening -- on the critical path of every call's setup latency.
+
+    The defaults below are tuned for telephony rather than for Silero's
+    stock assumption of a clean, wideband desktop microphone. A phone line
+    carries constant low-level hiss, comfort noise and codec artifacts, and
+    the stock settings treat a lot of that as speech -- which is what makes
+    an agent talk over people, cut itself off mid-sentence, or take turns
+    nobody asked for. Every value is overridable by environment variable so
+    a deployment can retune against real call recordings without a code
+    change.
+    """
+    proc.userdata["vad"] = silero.VAD.load(
+        # 50ms (the stock value) is short enough that a line pop, a door, or
+        # a single clacked key registers as the start of a turn. 150ms still
+        # catches a real "yes" but ignores the blips.
+        min_speech_duration=_env_float("VAD_MIN_SPEECH_DURATION", 0.15),
+        # How long a pause has to run before the turn is considered over.
+        # Nudged up from 0.55 because this agent's callers are elderly and
+        # often pause mid-thought; being cut off mid-sentence is worse here
+        # than a slightly later reply.
+        min_silence_duration=_env_float("VAD_MIN_SILENCE_DURATION", 0.65),
+        # Audio kept from just before speech was detected, so the STT still
+        # hears the word's onset. Left at the stock value.
+        prefix_padding_duration=_env_float("VAD_PREFIX_PADDING_DURATION", 0.5),
+        # Raised from 0.5: on a noisy line, 0.5 fires on the noise floor.
+        activation_threshold=_env_float("VAD_ACTIVATION_THRESHOLD", 0.6),
+        # Deliberately far below the activation threshold. This hysteresis
+        # band is what keeps a turn alive through the quiet dips inside
+        # normal speech; with the two thresholds close together, the VAD
+        # flickers between speech and silence mid-sentence.
+        deactivation_threshold=_env_float("VAD_DEACTIVATION_THRESHOLD", 0.35),
+        # Silero ships an 8kHz variant matching telephony's native rate.
+        # Left at 16000 because this same worker also serves console/web
+        # sessions with wideband audio; a phone-only deployment can try
+        # VAD_SAMPLE_RATE=8000.
+        sample_rate=_env_int("VAD_SAMPLE_RATE", 16000, allowed=(8000, 16000)),
+    )
 
 
 server = AgentServer(setup_fnc=prewarm)
@@ -465,7 +978,14 @@ async def entrypoint(ctx: JobContext):
     phone_number = dial_info.get("phone_number")
     call_id = dial_info.get("call_id")
     callback_url = dial_info.get("callback_url")
-    language = dial_info.get("language") or "en"
+    profile = resolve_language(dial_info.get("language"))
+    logger.info(
+        "call %s running in %s (%s)",
+        call_id,
+        profile.name,
+        profile.bcp47,
+        extra={"call_id": call_id},
+    )
 
     llm = _build_llm()
     # Fire-and-forget: prewarm() schedules a background task and returns
@@ -474,11 +994,11 @@ async def entrypoint(ctx: JobContext):
     llm.prewarm()
 
     session = AgentSession(
-        stt=_build_stt(language),
+        stt=_build_stt(profile),
         llm=llm,
-        tts=_build_tts(language),
+        tts=_build_tts(profile),
         turn_handling=TurnHandlingOptions(
-            turn_detection=MultilingualModel(),
+            turn_detection=resolve_turn_detection(profile),
             # "dynamic" adapts the end-of-turn wait to each caller's actual
             # pause patterns instead of always waiting the full min_delay,
             # so replies come faster for callers who don't pause much.
@@ -487,8 +1007,11 @@ async def entrypoint(ctx: JobContext):
                 "enabled": True,
                 # Start TTS before the turn is fully confirmed, not just the
                 # LLM. Cuts more latency at the cost of occasionally wasted
-                # synthesis when a preemptive guess gets discarded.
-                "preemptive_tts": True,
+                # synthesis when a preemptive guess gets discarded. On a
+                # noisy line that waste goes up along with the false starts,
+                # so PREEMPTIVE_TTS=0 is the first thing to try if calls
+                # sound unstable after the VAD retune.
+                "preemptive_tts": _env_bool("PREEMPTIVE_TTS", True),
             },
             # Adaptive interruption uses an audio model to tell real
             # barge-ins apart from backchannel acknowledgments ("mm-hmm",
@@ -496,7 +1019,24 @@ async def entrypoint(ctx: JobContext):
             # calls LiveKit Cloud's inference gateway, which phone calls
             # already require (see SIP_OUTBOUND_TRUNK_ID / README) — it only
             # adds a cloud dependency for fully self-hosted local testing.
-            interruption={"mode": "adaptive", "min_duration": 0.5, "min_words": 0},
+            interruption={
+                "mode": "adaptive",
+                "min_duration": _env_float("INTERRUPTION_MIN_DURATION", 0.6),
+                # The single biggest source of an agent being cut off by
+                # nothing: with min_words at 0, any burst of audio the VAD
+                # accepts stops the agent mid-sentence -- a television in
+                # the background, a cough, a passing siren. Requiring at
+                # least one actually-transcribed word means a real utterance
+                # interrupts and ambient noise doesn't.
+                "min_words": _env_int("INTERRUPTION_MIN_WORDS", 1),
+                # The greeting is uninterruptible on phone calls (see
+                # DefaultAgent.on_enter), and the stock behaviour is to
+                # throw away audio captured while the agent can't be
+                # interrupted. People answer the phone with "Hello?" -- that
+                # belongs in the transcript, not in the bin, so keep it and
+                # let it be handled as soon as the greeting finishes.
+                "discard_audio_if_uninterruptible": False,
+            },
         ),
         vad=ctx.proc.userdata["vad"],
     )
@@ -541,7 +1081,12 @@ async def entrypoint(ctx: JobContext):
                 detail = f"{e.sip_status_code} {e.sip_status}"
             else:
                 detail = f"{e.code} {e.message}"
-            logger.warning("outbound call to %s failed: %s", phone_number, detail)
+            logger.warning(
+                "outbound call to %s failed: %s",
+                phone_number,
+                detail,
+                extra={"call_id": call_id},
+            )
             if call_id and callback_url:
                 # on_session_end won't fire since no session ever started;
                 # report the failure directly so the outbound call API
@@ -556,15 +1101,41 @@ async def entrypoint(ctx: JobContext):
             ctx.shutdown(reason="sip call failed")
             return
 
-    await session.start(
-        agent=DefaultAgent(
-            prompt=dial_info.get("prompt"),
-            helper_prompt=dial_info.get("helper_prompt"),
-            language=language,
-        ),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(**room_options_kwargs),
-    )
+    try:
+        await session.start(
+            agent=DefaultAgent(
+                prompt=dial_info.get("prompt"),
+                helper_prompt=dial_info.get("helper_prompt"),
+                language=profile.code,
+                greeting=dial_info.get("greeting"),
+                # Only phone calls need the media-path settle delay, and only
+                # phone calls need an uninterruptible greeting: on a console or
+                # web session there's no carrier in the middle and no line noise
+                # to protect the opening line from.
+                greeting_delay=SIP_GREETING_DELAY if phone_number else 0.0,
+                greeting_interruptible=not phone_number,
+            ),
+            room=ctx.room,
+            room_options=room_io.RoomOptions(**room_options_kwargs),
+        )
+    except Exception as exc:
+        # Anything that stops the session from starting -- a bad
+        # service-account key, a provider outage, the inference gateway
+        # refusing -- would otherwise end this job with nobody told. There is
+        # no session for on_session_end to summarize, so without this the
+        # caller waits out CALL_TIMEOUT_SECONDS for a timeout that says
+        # nothing about what actually broke. Report it while we still know.
+        logger.exception(
+            "failed to start session for call %s",
+            call_id,
+            extra={"call_id": call_id},
+        )
+        if call_id and callback_url:
+            await _post_callback(
+                callback_url,
+                {"call_id": call_id, "error": f"failed to start session: {exc}"},
+            )
+        raise
 
     background_audio = BackgroundAudioPlayer(
         ambient_sound=AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=1.0)

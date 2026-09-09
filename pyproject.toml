@@ -23,6 +23,15 @@ dependencies = [
     "httpx",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    # Metrics/tracing for src/api.py (see the "Observability" section in
+    # README.md). Already pulled in transitively by livekit-agents, but
+    # pinned explicitly here since api.py imports them directly at runtime
+    # -- an upstream change to livekit-agents' own deps shouldn't be able to
+    # silently break api.py's /metrics endpoint.
+    "prometheus-client>=0.20",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [project.optional-dependencies]
