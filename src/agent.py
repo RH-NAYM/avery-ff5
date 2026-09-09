@@ -34,7 +34,7 @@ from livekit.plugins import (
     openai,
     silero,
 )
-from livekit.plugins.google.beta import GeminiTTS
+from livekit.plugins.google.beta import GeminiSTT, GeminiTTS
 
 from languages import (
     DEFAULT_LANGUAGE,
@@ -170,12 +170,13 @@ DEFAULT_GREETING = AGENT_GREETING_OVERRIDE or LANGUAGES["en"].greeting
 def resolve_turn_detection(profile: LanguageProfile):
     """The turn detector for this language, or None to fall back to VAD.
 
-    The audio turn detector covers 14 languages; Bengali and Malay are not
-    among them, and neither were they on the older text model this replaced.
-    Handing it an unsupported language isn't an error -- it just quietly stops
-    contributing, and turns commit on the endpointing delay alone. That is a
-    real difference in how the call feels, so it gets said out loud once per
-    call rather than being discovered later from a transcript.
+    The audio turn detector covers 14 languages; of the ones this product
+    supports, only Bengali is outside that set (English, Spanish, Arabic and
+    Hindi are all covered). Handing it an unsupported language isn't an error
+    -- it just quietly stops contributing, and turns commit on the
+    endpointing delay alone. That is a real difference in how the call feels,
+    so it gets said out loud once per call rather than being discovered later
+    from a transcript.
     """
     if profile.code not in TURN_DETECTOR_LANGUAGES:
         logger.warning(
@@ -229,38 +230,131 @@ CALLBACK_SECRET = os.environ.get("CALLBACK_SECRET") or None
 def _resolve_stt_provider(profile: LanguageProfile) -> str:
     """Which STT provider serves this language.
 
-    Precedence: an explicit per-language override, then the language's own
-    pinned provider, then the global default. The pin beats STT_PROVIDER on
-    purpose -- a language pinned here is one the global provider was observed
-    to fail on, and silently honouring STT_PROVIDER would just reproduce the
-    failure (an agent that never answers) on every call in that language.
+    Precedence: an explicit per-language override (STT_PROVIDER_<CODE>), then
+    the language's own pin, then the global STT_PROVIDER, then ElevenLabs.
+
+    ElevenLabs (`scribe_v2_realtime`) became the default on 2026-09-09, now
+    that ELEVENLABS_API_KEY is set. It covers all five supported languages in
+    one streaming model, rating "Good" (Arabic) to "Excellent" (English,
+    Spanish) on ElevenLabs' own WER accuracy tiers, and it sidesteps a Google
+    v1 streaming failure that was never root-caused: on a live Bengali call
+    with `google_stt_model="latest_long"`, the recognizer worked for one
+    exchange and then produced no interim or final results for the rest of
+    the call (no error, no reconnect, nothing in the logs) until the caller
+    hung up. Google Cloud Speech-to-Text remains fully wired (STT_PROVIDER=
+    google) -- it authenticates with the same service account as the LLM/TTS
+    and is the fallback if ElevenLabs has its own problems on a live call.
+    Gemini live transcription (`gemini-3.5-transcribe-live`) would cover all
+    five languages too and reuse that same service account, but on two
+    separate live calls Vertex AI returned "Publisher model ... was not
+    found" for it, once with `location="us-central1"` and once with
+    `location="global"` -- same error both times means the model genuinely
+    isn't deployed as a Vertex publisher model on this project right now, not
+    a location mistake. Set GEMINI_API_KEY (from Google AI Studio, not a
+    service account) to switch STT_PROVIDER=gemini onto that non-Vertex path
+    and try it again; until then it will fail every call.
     """
     override = os.environ.get(f"STT_PROVIDER_{profile.code.upper()}")
     if override:
         return override.lower()
     if profile.stt_provider:
         return profile.stt_provider.lower()
-    return os.environ.get("STT_PROVIDER", "google").lower()
+
+    default = os.environ.get("STT_PROVIDER", "elevenlabs").lower()
+    # Being forced onto a Google path that can't stream this language is the
+    # worst option on the menu, so prefer ElevenLabs over it if a key exists.
+    if (
+        default == "google"
+        and not profile.google_stt_streaming
+        and os.environ.get("ELEVENLABS_API_KEY")
+    ):
+        return "elevenlabs"
+    return default
 
 
 def _build_stt(profile: LanguageProfile):
     provider = _resolve_stt_provider(profile)
-    logger.info(
-        "using %s STT for %s (%s)%s",
-        provider,
-        profile.name,
-        profile.bcp47,
-        ""
-        if provider != "google" or profile.google_stt_streaming
-        else " in VAD-segmented mode (streaming recognition is unreliable for "
-        "this language, see LanguageProfile.google_stt_streaming)",
-    )
+    degraded = provider == "google" and not profile.google_stt_streaming
+    if degraded:
+        # Say this loudly and every call. It is the difference between "the
+        # prompt needs work" and "the recognizer is the wrong one", and from
+        # the transcript alone those look identical.
+        logger.warning(
+            "STT for %s is on a degraded path: Google's v1 %r model, recognized "
+            "in VAD-cut segments because streaming returns nothing for this "
+            "language. Expect poor accuracy and no transcript until the caller "
+            "stops speaking. Fix by setting ELEVENLABS_API_KEY (this language "
+            "then switches to scribe_v2_realtime automatically), or by enabling "
+            "Google chirp_2 -- see 'Language support' in README.md.",
+            profile.name,
+            _google_stt_model(profile),
+        )
+    else:
+        logger.info(
+            "using %s STT for %s, expecting %s",
+            provider,
+            profile.name,
+            "/".join(profile.stt_language_codes),
+        )
+    if provider == "gemini":
+        # gemini-3.5-transcribe-live, over the Live API. Streams with interim
+        # results and supports bn-BD / hi-IN / ar-EG / es-US / en-US directly,
+        # so it needs neither the v2 Chirp IAM grant nor an ElevenLabs key --
+        # it reuses the Vertex service account the LLM and TTS already use.
+        gemini_stt_model = os.environ.get(
+            "GEMINI_STT_MODEL", "gemini-3.5-transcribe-live"
+        )
+        gemini_stt_key = os.environ.get("GEMINI_API_KEY")
+        if gemini_stt_key:
+            return GeminiSTT(
+                model=gemini_stt_model,
+                language=profile.bcp47,
+                language_codes=list(profile.stt_language_codes),
+                api_key=gemini_stt_key,
+            )
+        return GeminiSTT(
+            model=gemini_stt_model,
+            language=profile.bcp47,
+            language_codes=list(profile.stt_language_codes),
+            vertexai=True,
+            # Reads project_id straight out of the key file, same as the
+            # Vertex fallbacks in _build_llm / _build_tts.
+            credentials_path=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
+            # The plugin itself defaults to "global" when no location is
+            # passed (see gemini_stt.py: `location = self._opts.location or
+            # "global"`) -- that is also what the Vertex LLM/TTS fallbacks
+            # above use successfully. "us-central1" was tried first and
+            # produced "Publisher model ... was not found" on this project,
+            # so match what already works instead of pinning a region.
+            location=os.environ.get("GEMINI_STT_LOCATION", "global"),
+        )
+
     if provider == "elevenlabs":
         # scribe_v2_realtime is the streaming model; the older scribe_v1 is
         # batch-only, which on a live call means waiting for an utterance to
         # end before any text exists. Scribe also covers all five supported
         # languages, which is why it's the fallback when Google's model for a
         # language isn't available -- see README's "Language support".
+        #
+        # server_vad is NOT optional. Without it the plugin connects with
+        # commit_strategy=manual, which tells ElevenLabs' server to never
+        # finalize a transcript on its own -- it only commits when the client
+        # sends an explicit "commit": true message, which the installed
+        # plugin (livekit-plugins-elevenlabs, checked in
+        # .venv/.../elevenlabs/stt.py) only ever sends when its stream's
+        # .flush() is called. Nothing in livekit-agents' AudioRecognition
+        # calls .flush() on a streaming STT mid-call (that's a StreamAdapter-
+        # only concept, for non-streaming plugins) -- it only pushes extra
+        # silence *audio* through _commit_user_turn(), which manual-strategy
+        # ElevenLabs has no way to interpret as "finalize now". Net effect,
+        # confirmed on a live Bengali call: partial_transcript kept arriving
+        # and drifting/hallucinating for 40+ seconds after the caller spoke
+        # once, committed_transcript never arrived, and the agent never
+        # produced a reply. Passing server_vad switches the connection to
+        # commit_strategy=vad, which makes ElevenLabs' own server finalize on
+        # silence the way every other streaming STT here already does.
+        vad_silence_threshold_secs = _env_float("ELEVENLABS_STT_VAD_SILENCE_SECS", 1.5)
+        vad_min_silence_duration_ms = _env_int("ELEVENLABS_STT_VAD_MIN_SILENCE_MS", 800)
         return elevenlabs.STT(
             api_key=_require_env("ELEVENLABS_API_KEY"),
             model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2_realtime"),
@@ -268,6 +362,13 @@ def _build_stt(profile: LanguageProfile):
             # language code and would reject "bn-BD". Google is the opposite --
             # region genuinely changes the recognition target there.
             language_code=profile.code,
+            server_vad={
+                "vad_silence_threshold_secs": vad_silence_threshold_secs,
+                # ElevenLabs' own default (2500ms) is sluggish for a phone
+                # call -- 800ms roughly matches VAD_MIN_SILENCE_DURATION used
+                # for the session's own turn-taking VAD below.
+                "min_silence_duration_ms": vad_min_silence_duration_ms,
+            },
         )
     if provider == "google":
         # Google Cloud Speech-to-Text, authenticated with a service account
@@ -275,25 +376,23 @@ def _build_stt(profile: LanguageProfile):
         # service account used by the Vertex AI fallback for
         # LLM_PROVIDER=gemini / TTS_PROVIDER=gemini below.
         #
-        # Optional: set GOOGLE_STT_MODEL="telephony" to use Google STT v2's
-        # model tuned for 8kHz phone-call audio (vs "latest_long" here,
-        # tuned for long-form dictation/video). NOT the default: "telephony"
-        # requires the Speech-to-Text v2 API and the
-        # speech.recognizers.recognize IAM permission on the service
-        # account, which this project's service account does not currently
-        # have (confirmed: it 403s on that permission) -- v1's "latest_long"
-        # is what your service account is actually provisioned for.
+        # The model comes from the language profile, because it decides both
+        # the quality and (via the plugin) the API version: v2 for
+        # telephony/chirp_2/chirp_3, v1 for everything else. chirp_2 is the
+        # right answer for the non-English languages but needs the v2 API,
+        # roles/speech.client on the service account, and a non-global
+        # GOOGLE_STT_LOCATION -- see "Language support" in README.md.
         return google.STT(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
             model=_google_stt_model(profile),
             # Without this the plugin uses its own "en-US" default, which is
             # what made every call transcribe as English regardless of the
             # language requested.
-            languages=profile.bcp47,
-            # The language is fixed per call by the API contract, so lock the
-            # recognizer to it instead of letting it hunt -- detection costs
-            # accuracy, and there is nothing to detect when we already know.
-            detect_language=False,
+            languages=list(profile.stt_language_codes),
+            # "Detection" only in the sense of choosing among the languages
+            # listed above. The call's language is fixed, but a caller dropping
+            # English words into it is normal speech, not an error to correct.
+            detect_language=len(profile.stt_language_codes) > 1,
             location=os.environ.get("GOOGLE_STT_LOCATION", "global"),
             # False here doesn't disable transcription -- it makes the
             # framework segment audio with VAD and recognize each utterance as
@@ -302,7 +401,8 @@ def _build_stt(profile: LanguageProfile):
             use_streaming=profile.google_stt_streaming,
         )
     raise ValueError(
-        f"Unknown STT_PROVIDER: {provider!r} (expected 'elevenlabs' or 'google')"
+        f"Unknown STT_PROVIDER: {provider!r} "
+        "(expected 'gemini', 'google', or 'elevenlabs')"
     )
 
 
@@ -394,7 +494,11 @@ def _build_tts(profile: LanguageProfile):
         # own TTS model instead of the Cloud Text-to-Speech API.
         return google.TTS(
             credentials_file=_require_env("GOOGLE_APPLICATION_CREDENTIALS"),
-            language=profile.bcp47,
+            # Chirp3-HD voices only cover a subset of locales -- bn-IN and
+            # ar-XA, not bn-BD/ar-EG -- so this uses google_tts_bcp47 when the
+            # profile has one instead of bcp47 directly. See that field's
+            # docstring in languages.py.
+            language=profile.google_tts_bcp47 or profile.bcp47,
             voice_name=os.environ.get(f"GOOGLE_TTS_VOICE_{profile.code.upper()}")
             or os.environ.get("GOOGLE_TTS_VOICE")
             or NOT_GIVEN,

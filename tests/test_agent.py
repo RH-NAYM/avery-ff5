@@ -550,13 +550,13 @@ def test_non_object_job_metadata_is_ignored() -> None:
 
 
 # --- Multilingual support ---------------------------------------------------
-# en / bn / es / ar / ms. The failure mode these guard against is silent: the
+# en / bn / es / ar / hi. The failure mode these guard against is silent: the
 # language used to be threaded through the whole pipeline and then dropped
 # before it ever reached STT, so a Bengali call was transcribed as en-US and
 # nobody found out until they read the transcript.
 
 
-@pytest.mark.parametrize("code", ["en", "bn", "es", "ar", "ms"])
+@pytest.mark.parametrize("code", ["en", "bn", "es", "ar", "hi"])
 def test_every_supported_language_is_fully_configured(code: str) -> None:
     profile = LANGUAGES[code]
     assert profile.code == code
@@ -565,10 +565,10 @@ def test_every_supported_language_is_fully_configured(code: str) -> None:
     assert profile.google_stt_model
     # The greeting is spoken straight to TTS, and Gemini TTS infers the
     # language from the text it is handed -- so every language needs its own
-    # line, not the English one. Bengali and Arabic are non-Latin scripts, so
-    # they can be checked directly; Spanish and Malay share the alphabet with
-    # English, so the check is just that they aren't the English line.
-    if code in ("bn", "ar"):
+    # line, not the English one. Bengali, Arabic and Hindi are non-Latin
+    # scripts, so they can be checked directly; Spanish shares the alphabet
+    # with English, so the check is just that it isn't the English line.
+    if code in ("bn", "ar", "hi"):
         assert not profile.greeting.isascii(), (
             f"{code} greeting is not in its own script: {profile.greeting!r}"
         )
@@ -585,7 +585,7 @@ def test_every_supported_language_is_fully_configured(code: str) -> None:
         ("bengali", "bn"),
         ("ENGLISH", "en"),
         ("es-MX", "es"),
-        ("ms", "ms"),
+        ("hi", "hi"),
         ("ar", "ar"),
     ],
 )
@@ -625,10 +625,14 @@ def test_google_stt_receives_the_call_language() -> None:
 
     # The bug: this used to be absent entirely, so the plugin fell back to
     # its own "en-US" default on every single call.
-    assert captured["languages"] == "bn-BD"
-    assert captured["detect_language"] is False
-    # latest_long is a v1 model that does not cover Bengali.
-    assert captured["model"] != "latest_long"
+    assert captured["languages"] == ["bn-BD", "en-US"]
+    # Detection is on only to choose between those two -- the call's language
+    # is still fixed, English is just allowed alongside it.
+    assert captured["detect_language"] is True
+    # Google's official v1 table lists bn-BD under latest_long -- confirmed
+    # 2026-09-09, reversing an earlier, never-actually-tested assumption.
+    assert captured["model"] == "latest_long"
+    assert captured["use_streaming"] is True
 
 
 def test_elevenlabs_stt_receives_the_call_language_and_a_streaming_model() -> None:
@@ -639,12 +643,43 @@ def test_elevenlabs_stt_receives_the_call_language_and_a_streaming_model() -> No
         ),
         patch.object(agent_module.elevenlabs, "STT", stub),
     ):
-        agent_module._build_stt(LANGUAGES["ms"])
+        agent_module._build_stt(LANGUAGES["hi"])
 
-    assert captured["language_code"] == "ms"
+    assert captured["language_code"] == "hi"
     # scribe_v1 is batch-only; on a live call that means no text until the
     # utterance has already ended.
     assert captured["model"] == "scribe_v2_realtime"
+    # Regression test: without server_vad, the plugin connects with
+    # commit_strategy=manual, which never finalizes a transcript on its own
+    # (confirmed on a live Bengali call -- partial_transcript kept arriving
+    # and drifting for 40+ seconds, committed_transcript never arrived, the
+    # agent never replied). server_vad must always be passed.
+    assert captured["server_vad"] == {
+        "vad_silence_threshold_secs": 1.5,
+        "min_silence_duration_ms": 800,
+    }
+
+
+def test_elevenlabs_stt_vad_silence_is_overridable() -> None:
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "STT_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "k",
+                "ELEVENLABS_STT_VAD_SILENCE_SECS": "2.0",
+                "ELEVENLABS_STT_VAD_MIN_SILENCE_MS": "1200",
+            },
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES["en"])
+
+    assert captured["server_vad"] == {
+        "vad_silence_threshold_secs": 2.0,
+        "min_silence_duration_ms": 1200,
+    }
 
 
 def test_google_stt_model_is_overridable_per_language() -> None:
@@ -654,7 +689,7 @@ def test_google_stt_model_is_overridable_per_language() -> None:
         assert agent_module._google_stt_model(LANGUAGES["en"]) == "latest_long"
 
 
-@pytest.mark.parametrize("code", ["bn", "es", "ar", "ms"])
+@pytest.mark.parametrize("code", ["bn", "es", "ar", "hi"])
 def test_default_persona_greets_in_the_call_language(code: str) -> None:
     assert DefaultAgent(language=code).resolve_greeting() == LANGUAGES[code].greeting
 
@@ -685,18 +720,187 @@ def test_closing_agent_stays_in_the_call_language() -> None:
 
 @pytest.mark.asyncio
 async def test_wrap_up_handoff_preserves_the_language() -> None:
-    closing = await DefaultAgent(language="ms").begin_wrap_up()
-    assert "Malay" in closing.instructions
+    closing = await DefaultAgent(language="hi").begin_wrap_up()
+    assert "Hindi" in closing.instructions
 
 
-@pytest.mark.parametrize("code", ["en", "es", "ar"])
+@pytest.mark.parametrize("code", ["en", "es", "ar", "hi"])
 def test_turn_detector_is_used_for_supported_languages(code: str) -> None:
     assert agent_module.resolve_turn_detection(LANGUAGES[code]) is not None
 
 
-@pytest.mark.parametrize("code", ["bn", "ms"])
+@pytest.mark.parametrize("code", ["bn"])
 def test_turn_detector_falls_back_to_vad_for_unsupported_languages(code: str) -> None:
     # Neither the old text model nor the audio model scores these. Returning
     # None is the honest answer -- the session then commits turns on the
     # endpointing delay instead of pretending it has a signal.
     assert agent_module.resolve_turn_detection(LANGUAGES[code]) is None
+
+
+# --- STT provider selection (ElevenLabs is the default) --------------------
+
+
+def test_elevenlabs_is_the_default_stt_for_every_language() -> None:
+    # ElevenLabs (scribe_v2_realtime) covers all five languages in one
+    # streaming model and sidesteps a Google v1 streaming failure that was
+    # never root-caused (worked for one exchange on a live Bengali call, then
+    # went silent with no error for the rest of the call). This is the code
+    # default even with no ELEVENLABS_API_KEY in the environment -- the key's
+    # absence only breaks _build_stt (via _require_env), not provider
+    # selection, so that failure is loud and immediate rather than a silent
+    # fallback to a different provider.
+    with patch.dict("os.environ", {}, clear=False):
+        os_env = agent_module.os.environ
+        os_env.pop("STT_PROVIDER", None)
+        os_env.pop("ELEVENLABS_API_KEY", None)
+        for code in LANGUAGES:
+            assert agent_module._resolve_stt_provider(LANGUAGES[code]) == "elevenlabs"
+
+
+def test_gemini_still_works_when_explicitly_selected() -> None:
+    # The Vertex path is broken on this deployment right now, but the code
+    # path itself stays fully wired -- setting GEMINI_API_KEY and
+    # STT_PROVIDER=gemini switches onto the (working) non-Vertex API-key path.
+    with patch.dict("os.environ", {"STT_PROVIDER": "gemini"}, clear=False):
+        for code in LANGUAGES:
+            assert agent_module._resolve_stt_provider(LANGUAGES[code]) == "gemini"
+
+
+def test_gemini_stt_gets_the_language_and_allows_english_alongside_it() -> None:
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "STT_PROVIDER": "gemini",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/key.json",
+            },
+        ),
+        patch.object(agent_module, "GeminiSTT", _Stub),
+    ):
+        agent_module._build_stt(LANGUAGES["bn"])
+
+    assert captured["language"] == "bn-BD"
+    # Bangla speakers routinely drop English words mid-sentence; a recognizer
+    # locked to one language turns those into native-sounding nonsense.
+    assert captured["language_codes"] == ["bn-BD", "en-US"]
+    assert captured["model"] == "gemini-3.5-transcribe-live"
+
+
+def test_gemini_stt_uses_vertex_when_no_api_key_is_set() -> None:
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    env = {
+        "STT_PROVIDER": "gemini",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/tmp/key.json",
+    }
+    with (
+        patch.dict("os.environ", env),
+        patch.object(agent_module, "GeminiSTT", _Stub),
+    ):
+        agent_module.os.environ.pop("GEMINI_API_KEY", None)
+        agent_module._build_stt(LANGUAGES["hi"])
+
+    # Same service account the LLM and TTS already authenticate with, so this
+    # needs no new key and no new IAM grant.
+    assert captured["vertexai"] is True
+    assert captured["credentials_path"] == "/tmp/key.json"
+    assert "api_key" not in captured
+
+
+def test_english_is_not_listed_twice_for_an_english_call() -> None:
+    assert LANGUAGES["en"].stt_language_codes == ("en-US",)
+
+
+@pytest.mark.parametrize("code", ["bn", "es", "ar", "hi"])
+def test_every_non_english_language_allows_english_alongside_it(code: str) -> None:
+    codes = LANGUAGES[code].stt_language_codes
+    assert codes[0].startswith(code)
+    assert "en-US" in codes
+
+
+def test_a_per_language_override_still_wins_over_the_default() -> None:
+    with patch.dict(
+        "os.environ",
+        {"STT_PROVIDER": "google", "STT_PROVIDER_BN": "elevenlabs"},
+        clear=False,
+    ):
+        assert agent_module._resolve_stt_provider(LANGUAGES["bn"]) == "elevenlabs"
+        # No override for hi, so it falls through to the global default --
+        # forced to "google" here specifically to prove the override beats
+        # it, not because google is the code default any more.
+        assert agent_module._resolve_stt_provider(LANGUAGES["hi"]) == "google"
+
+
+# --- TTS voice / locale (Google Chirp3-HD) -----------------------------------
+# TTS_PROVIDER=google switched from TTS_PROVIDER=gemini (which is hardcoded
+# non-streaming and was the root cause of "TTS buffering" reported on live
+# calls). Chirp3-HD, the voice set that gives named, same-character voices
+# across languages (e.g. "Leda"), only covers a subset of locales -- bn-IN
+# and ar-XA, not this project's STT-side bn-BD/ar-EG -- so _build_tts must
+# send Google's TTS a different language code than STT gets for those two.
+
+
+def _captured_tts():
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    return captured, _Stub
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_language"),
+    [
+        ("en", "en-US"),
+        ("bn", "bn-IN"),  # not bn-BD -- see google_tts_bcp47
+        ("es", "es-US"),
+        ("ar", "ar-XA"),  # not ar-EG -- see google_tts_bcp47
+        ("hi", "hi-IN"),
+    ],
+)
+def test_google_tts_uses_a_chirp3_hd_compatible_locale(
+    code: str, expected_language: str
+) -> None:
+    captured, stub = _captured_tts()
+    with (
+        patch.dict("os.environ", {"TTS_PROVIDER": "google"}, clear=False),
+        patch.object(agent_module.google, "TTS", stub),
+    ):
+        agent_module._build_tts(LANGUAGES[code])
+
+    assert captured["language"] == expected_language
+
+
+def test_google_tts_receives_the_per_language_voice_override(monkeypatch) -> None:
+    captured, stub = _captured_tts()
+    monkeypatch.setenv("TTS_PROVIDER", "google")
+    monkeypatch.setenv("GOOGLE_TTS_VOICE_BN", "bn-IN-Chirp3-HD-Leda")
+    with patch.object(agent_module.google, "TTS", stub):
+        agent_module._build_tts(LANGUAGES["bn"])
+
+    assert captured["voice_name"] == "bn-IN-Chirp3-HD-Leda"
+
+
+def test_google_tts_falls_back_to_the_unsuffixed_voice_override(monkeypatch) -> None:
+    # A language with no GOOGLE_TTS_VOICE_<CODE> of its own still gets the
+    # unsuffixed GOOGLE_TTS_VOICE, same fallback pattern as ELEVENLABS_VOICE_ID.
+    captured, stub = _captured_tts()
+    monkeypatch.setenv("TTS_PROVIDER", "google")
+    monkeypatch.delenv("GOOGLE_TTS_VOICE_HI", raising=False)
+    monkeypatch.setenv("GOOGLE_TTS_VOICE", "en-US-Chirp3-HD-Leda")
+    with patch.object(agent_module.google, "TTS", stub):
+        agent_module._build_tts(LANGUAGES["hi"])
+
+    assert captured["voice_name"] == "en-US-Chirp3-HD-Leda"

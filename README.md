@@ -50,11 +50,15 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
      - `LIVEKIT_API_KEY`
      - `LIVEKIT_API_SECRET`
      - any provider API key listed in `.env.example` (realtime models are bring-your-own-key)
-     - if you're using Google (Gemini LLM/TTS, or `STT_PROVIDER`/`TTS_PROVIDER=google`) with a
-       **service account** instead of an API key, you only need to set
-       `GOOGLE_APPLICATION_CREDENTIALS` to the JSON key file's path — the project is
-       auto-inferred from the key file itself, and the Vertex AI location defaults to
-       `us-central1`. Leave the matching API key (`GEMINI_API_KEY`) blank to trigger this.
+     - if you're using Google (Gemini LLM/TTS, or `STT_PROVIDER=google` as a fallback
+       for the ElevenLabs default) with a **service account** instead of an API key,
+       you only need to set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON key file's
+       path — the project is auto-inferred from the key file itself, and the Vertex
+       AI location defaults to `us-central1`. Leave the matching API key
+       (`GEMINI_API_KEY`) blank to trigger this.
+     - **speech recognition defaults to ElevenLabs** (`STT_PROVIDER=elevenlabs`), so
+       set `ELEVENLABS_API_KEY` too — see "Speech recognition" under "Language
+       support" below for why, and for the Google/Gemini STT fallbacks.
 
    - **Automatic setup** (recommended): Use the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
      ```bash
@@ -98,7 +102,13 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
 
 This project can run entirely on your own machine, with a self-hosted LiveKit Server, and **without a LiveKit Cloud account**. The agent still talks to external AI providers directly, using your own credentials, instead of routing through [LiveKit Inference](https://docs.livekit.io/agents/models/inference).
 
-By default (`STT_PROVIDER`/`LLM_PROVIDER`/`TTS_PROVIDER=google`/`gemini`), that's a single Google Cloud service account covering all three stages via Vertex AI + Cloud Speech-to-Text:
+By default, `LLM_PROVIDER=gemini` uses a Google Cloud service account via
+Vertex AI, and `TTS_PROVIDER=google` uses the same service account for Google
+Cloud Text-to-Speech (chosen over `TTS_PROVIDER=gemini` because it streams
+synthesis — see ".env.local" for why the Gemini TTS path causes buffering
+pauses). STT defaults separately to ElevenLabs (`STT_PROVIDER=elevenlabs`,
+see "Speech recognition" under "Language support" for why) — set
+`GOOGLE_APPLICATION_CREDENTIALS` for LLM/TTS and `ELEVENLABS_API_KEY` for STT:
 
 ```text
 Local LiveKit Server (livekit-server --dev)
@@ -106,9 +116,9 @@ Local LiveKit Server (livekit-server --dev)
         ▼
 LiveKit Agent Worker (src/agent.py)
         │
-        ├── STT  → Google Cloud Speech-to-Text  (GOOGLE_APPLICATION_CREDENTIALS)
-        ├── LLM  → Gemini via Vertex AI          (GOOGLE_APPLICATION_CREDENTIALS)
-        └── TTS  → Gemini TTS via Vertex AI      (GOOGLE_APPLICATION_CREDENTIALS)
+        ├── STT  → ElevenLabs Scribe v2 Realtime (ELEVENLABS_API_KEY)
+        ├── LLM  → Gemini via Vertex AI           (GOOGLE_APPLICATION_CREDENTIALS)
+        └── TTS  → Gemini TTS via Vertex AI       (GOOGLE_APPLICATION_CREDENTIALS)
 ```
 
 Every stage is independently swappable to a different provider (ElevenLabs, Cartesia, OpenAI, ...) via its own `*_PROVIDER` env var - see `.env.example` for the full list.
@@ -361,7 +371,7 @@ Under the hood, `create_outbound_call` dispatches the agent with a `callback_url
 
 ## Language support
 
-The agent supports **English, Bengali (Bangla), Spanish, Arabic and Malay**. The
+The agent supports **English, Bengali (Bangla), Spanish, Arabic and Hindi**. The
 language is fixed for the whole call and comes from the `langage` field on
 `POST /calls/outbound`. Short codes (`bn`), locales (`bn-BD`) and English names
 (`bengali`) are all accepted; anything else is rejected with a `400` rather than
@@ -379,64 +389,160 @@ fine, and one reviewable persona beats five translations that drift apart.
 
 ### What each part of the pipeline covers
 
-| | en | es | ar | bn | ms |
+| | en | es | ar | bn | hi |
 |---|---|---|---|---|---|
-| **STT** — Google `latest_long` (v1, streaming) | ✅ | ✅ | — | ❌ | ❌ |
-| **STT** — Google `default` (v1, VAD-segmented) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — ElevenLabs `scribe_v2_realtime` **(default for all five, 2026-09-09)** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Google `latest_long` (v1, streaming) — fallback (`STT_PROVIDER=google`) | ✅ | ✅ | ✅ | ✅ | ❔ |
+| **STT** — Google `default` (v1, VAD-segmented) — fallback if latest_long is wrong | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **STT** — Google `chirp_2` (v2) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **STT** — ElevenLabs `scribe_v2_realtime` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Gemini `gemini-3.5-transcribe-live` — **currently broken on Vertex, see below** | ❔ | ❔ | ❔ | ❔ | ❔ |
 | **LLM** — Gemini 2.5 Flash | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **TTS** — Gemini (infers language from text) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Turn detector** — `inference.TurnDetector` | ✅ | ✅ | ✅ | ❌ | ❌ |
+| **Turn detector** — `inference.TurnDetector` | ✅ | ✅ | ✅ | ❌ | ✅ |
 
-### Streaming vs VAD-segmented recognition
+Hindi's Google `latest_long` row is "❔" rather than "✅" because its row
+wasn't reachable in the doc fetch used to confirm bn/ar (the table is
+alphabetical and got cut off before H) — it's a reasonable bet given Hindi's
+generally strong Google support, not a confirmed fact the way bn/ar are. This
+only matters if you fall back to `STT_PROVIDER=google`; ElevenLabs' own
+documented coverage confirms all five languages directly, with per-language
+WER accuracy tiers (see "Speech recognition" below).
 
-Confirmed on a live Bengali call: Google's **v1 streaming** recognizer returned
-no interim and no final result for the entire call, then delivered the whole
-minute of speech as one transcript the moment the caller hung up. The agent had
-nothing to answer for the whole call — from the caller's side, it simply never
-responded.
+### Speech recognition
 
-So `bn`, `ms` and `ar` set `google_stt_streaming=False`. That does **not**
-disable transcription: the plugin advertises itself as non-streaming, and the
-framework wraps it in `stt.StreamAdapter`, which uses the session's Silero VAD
-to cut audio into utterances and recognizes each one as it ends. Recognition
-starts after the person stops talking rather than while they speak — slower,
-but it produces a turn, which streaming here did not. `en` and `es` stay on
-streaming `latest_long`.
+The default is **ElevenLabs `scribe_v2_realtime`** (`STT_PROVIDER=elevenlabs`,
+needs `ELEVENLABS_API_KEY`), as of 2026-09-09. It covers all five supported
+languages in one streaming model, and ElevenLabs' own documentation rates
+per-language WER accuracy as: English & Spanish "Excellent (≤5% WER)",
+Bengali & Hindi "High Accuracy (>5–10% WER)", Arabic "Good (>10–20% WER)".
+Override globally with `STT_PROVIDER`, or per language with `STT_PROVIDER_BN`
+and friends.
 
-The worker says which mode it picked at the start of every call:
+**Why not Google, which was the default until now.** All five languages were
+moved to Google's `latest_long` v1 streaming model earlier the same day (see
+git history / project notes), reversing an earlier, never-actually-tested
+assumption that `latest_long` didn't cover Bengali. That fixed accuracy for
+one exchange on a live Bengali call — then the recognizer went completely
+silent for the rest of the call (no interim or final results, no error, no
+reconnect logged) until the caller hung up. Digging through the installed
+plugin's reconnect logic (5-minute session timer, gRPC 409 handling,
+confidence-threshold filtering) ruled out every documented cause without
+finding the real one. Rather than keep guessing and burning more live test
+calls, the default moved to a different STT engine entirely.
+`STT_PROVIDER=google` is still fully wired as a fallback if ElevenLabs turns
+out to have its own problems on a live call — see "Choosing an STT provider"
+below for the Google-specific model/region details.
+
+**Gemini live transcription (`gemini-3.5-transcribe-live`) would also cover
+all five languages natively and stream with interim results, and it reuses
+the same Vertex service account as the LLM/TTS** — but it is not currently
+usable on this deployment. Two separate live calls both failed identically:
+Vertex AI returned
+`Publisher model .../publishers/google/models/gemini-3.5-transcribe-live was
+not found`, once with `location="us-central1"` and once with
+`location="global"`. The same error in both locations rules out a location
+mistake — the model just isn't deployed as a Vertex publisher model on this
+project right now, most likely because it's still Gemini-Developer-API-only
+and hasn't rolled out to Vertex yet. Setting `GEMINI_API_KEY` (from
+[Google AI Studio](https://aistudio.google.com/), not a service account key)
+switches `STT_PROVIDER=gemini` onto that non-Vertex path instead — worth
+trying if you want a second fully-native-multilingual option, since the code
+path itself is fully wired and untouched by this issue.
+
+**English is always allowed alongside the call's language.** Each profile
+carries `stt_language_codes`, e.g. `("bn-BD", "en-US")`. Bangla, Hindi and
+Arabic speakers routinely drop English words mid-sentence — numbers, names,
+"doctor", "appointment" — and a recognizer locked to a single language turns
+those into the nearest native-sounding nonsense, which is then what the LLM has
+to reason about. English profiles list `("en-US",)` only. ElevenLabs itself
+takes a single bare language code (not a locale), so this code-switching list
+is Google-specific — the `elevenlabs` branch passes `profile.code` alone and
+relies on Scribe's own automatic language detection for any mid-sentence
+English.
+
+The worker states its choice at the start of every call:
 
 ```
-using google STT for Bengali (Bangla) (bn-BD) in VAD-segmented mode ...
+using elevenlabs STT for Bengali (Bangla), expecting bn-BD/en-US
 ```
 
-If you add an `ELEVENLABS_API_KEY`, `STT_PROVIDER_BN=elevenlabs` switches that
-language to `scribe_v2_realtime`, which is genuinely streaming and rates
-Bengali in ElevenLabs' high-accuracy tier. That is the better path once the key
-exists — it is not the default only because the key is currently empty in
-`.env.local`.
+#### If you fall back to Google and a language ends up on the non-streaming path
+
+Two distinct Google streaming failures have been seen on live calls, in case
+`STT_PROVIDER=google` is ever used again:
+
+1. With `model="default"`, the v1 **streaming** recognizer returned no
+   interim and no final result for the whole call, then delivered the entire
+   conversation as one transcript the moment the caller hung up.
+2. With `model="latest_long"`, streaming worked correctly for one exchange
+   (fast, accurate) and then went completely silent — no interim or final
+   results, no error, no reconnect logged — for the rest of a ~94-second
+   call. Reading the installed plugin's reconnect logic ruled out the
+   5-minute session-timeout reconnect, a gRPC 409 stream-timeout, and
+   confidence-threshold filtering as the cause; none of them fit. Root cause
+   was never found. **This is the actual reason ElevenLabs is now the
+   default** rather than continuing to debug Google's v1 streaming path.
+
+If a language needs to fall back within Google itself (model rejected, or
+streaming returns nothing), set `google_stt_streaming=False` on its profile.
+This does **not** disable transcription: the plugin advertises itself as
+non-streaming and the framework wraps it in `stt.StreamAdapter`, segmenting
+on Silero VAD and recognizing each utterance as it ends — slower and it only
+starts once you stop talking, but it produces a turn. That path logs a loud
+warning every call, because "the recognizer is the wrong one" and "the
+prompt needs work" look identical from a transcript.
+
+`chirp_2` (v2) is the best classic-Google option but needs three things:
+`speech.googleapis.com` enabled (already true), the **Cloud Speech Client**
+role (`roles/speech.client`) on the service account — that is the permission
+that currently returns `403` — and a **non-global** `GOOGLE_STT_LOCATION`,
+since `chirp_2` runs only in `us-central1`, `europe-west4` and
+`asia-southeast1` and is Private GA.
 
 **Turn detection.** The audio turn detector covers 14 languages
-(`ar de en es fr hi id it ja ko nl pt tr zh`). Bengali and Malay are not among
-them and were not on the older text model either. Those calls fall back to
-VAD-only endpointing — they work, but turn-taking is less responsive, and the
-worker logs a warning saying so at the start of each such call.
+(`ar de en es fr hi id it ja ko nl pt tr zh`) — English, Spanish, Arabic and
+Hindi are all in that set. **Bengali is the only supported language it
+doesn't cover**, and it wasn't on the older text model either. Bengali calls
+fall back to VAD-only endpointing — they work, but turn-taking is less
+responsive, and the worker logs a warning saying so at the start of each such
+call.
 
 ### Choosing an STT provider
 
-Google is the default (`STT_PROVIDER=google`). The catch is that the plugin
-picks the API version from the *model name* —
+`STT_PROVIDER=elevenlabs` (the default) uses `scribe_v2_realtime`, which
+covers all five languages with one model and needs no Google IAM change --
+just `ELEVENLABS_API_KEY`. Note the model is `scribe_v2_realtime`, not the
+older `scribe_v1`, which is batch-only: on a live call that means no text
+exists until the caller has already stopped speaking.
+
+**`server_vad` is not optional here.** The connection is opened with
+`commit_strategy=manual` unless `server_vad` is passed, and in manual mode
+ElevenLabs' server only finalizes a transcript when the client sends an
+explicit commit -- which the installed plugin only does when its stream is
+flushed, and nothing in `livekit-agents`' `AudioRecognition` flushes a
+streaming STT mid-call (that's a `StreamAdapter`-only concept). Without it,
+confirmed on a live Bengali call: `partial_transcript` messages kept arriving
+and drifting/hallucinating for 40+ seconds after the caller spoke once,
+`committed_transcript` never arrived, and the agent never replied -- the
+caller saw the same "STT is getting everything wrong" symptom as before, for
+an unrelated reason. `_build_stt` always passes
+`server_vad={"vad_silence_threshold_secs": ..., "min_silence_duration_ms":
+...}`, defaulting to 1.5s / 800ms and overridable with
+`ELEVENLABS_STT_VAD_SILENCE_SECS` / `ELEVENLABS_STT_VAD_MIN_SILENCE_MS`.
+
+`STT_PROVIDER=google` uses the classic Cloud Speech recognizer as a fallback.
+The catch there is that the plugin picks the API version from the *model
+name* —
 
 ```python
 return 2 if self.model in get_args(SpeechModelsV2) else 1   # v2: telephony, chirp_2, chirp_3
 ```
 
-— so `latest_long` means the **v1** API, and v1's `latest_long` does not cover
-Bengali or Malay. Those languages therefore default to the v1 `default` model,
-which has v1's widest language coverage and needs no extra setup. Per-language
-overrides: `GOOGLE_STT_MODEL_BN`, `GOOGLE_STT_MODEL_MS`, etc., or
-`GOOGLE_STT_MODEL` to change them all at once.
+— so `latest_long` means the **v1** API. Every language currently defaults to
+`latest_long` (see "Speech recognition" above); `google_stt_model="default"`
+remains the fallback for a language `latest_long` turns out not to actually
+serve. Per-language overrides: `GOOGLE_STT_MODEL_BN`, `GOOGLE_STT_MODEL_HI`,
+etc., or `GOOGLE_STT_MODEL` to change them all at once.
 
 To use **`chirp_2`** instead (best multilingual accuracy) you need three things,
 not just one:
@@ -449,11 +555,6 @@ not just one:
 3. A **non-global region**. `chirp_2` is not available in `global`; it runs in
    `us-central1`, `europe-west4` and `asia-southeast1` only, and is Private GA,
    so access has to be requested. Set `GOOGLE_STT_LOCATION` accordingly.
-
-The alternative is **ElevenLabs** (`STT_PROVIDER=elevenlabs`), which covers all
-five languages with one model and needs no Google IAM change. Note the default
-here is now `scribe_v2_realtime` — the older `scribe_v1` is batch-only, so on a
-live call no text exists until the caller has already stopped speaking.
 
 ### Voices
 

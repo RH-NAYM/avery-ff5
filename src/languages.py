@@ -53,6 +53,16 @@ class LanguageProfile:
     TTS, which infers language from the text it is given, an English greeting
     also makes the first audio come out in an English voice."""
 
+    stt_language_codes: tuple[str, ...] = ()
+    """Languages the recognizer should expect on this call, most likely first.
+
+    Every non-English profile lists English second on purpose. Bangla, Hindi
+    and Arabic speakers routinely drop English words mid-sentence -- numbers,
+    names, medicine names, "doctor", "appointment" -- and a recognizer locked
+    to one language turns those into the nearest native-sounding nonsense,
+    which is then what the LLM has to reason about. Listing both means the
+    model expects the mix instead of fighting it."""
+
     stt_provider: str | None = None
     """Pin this language to a specific STT provider, overriding STT_PROVIDER.
     Left unset for every language today; the per-language escape hatch is the
@@ -81,6 +91,16 @@ class LanguageProfile:
     name (v2 for telephony/chirp_2/chirp_3, v1 otherwise), so this field
     decides both. Override per language with GOOGLE_STT_MODEL_<CODE>."""
 
+    google_tts_bcp47: str | None = None
+    """Locale to hand Google Cloud TTS (TTS_PROVIDER=google) instead of
+    `bcp47`, when they differ. Google's Chirp3-HD voices -- the named,
+    same-character-across-languages voices (Leda, Kore, Aoede, ...; see
+    GOOGLE_TTS_VOICE_<CODE> in .env.local) -- aren't available for every
+    STT-side locale. bn-BD and ar-EG are not Chirp3-HD locales; bn-IN and
+    ar-XA are. Sending bcp47 straight through for those two would pair a
+    Chirp3-HD voice_name with a language_code it doesn't match, which the
+    API rejects outright. None means "same as bcp47" (true for en/es/hi)."""
+
 
 # NOTE: the greetings below were written to match the English one's tone (warm,
 # first-name, "calling to see how you are"). Have a native speaker review them
@@ -90,6 +110,7 @@ class LanguageProfile:
 LANGUAGES: dict[str, LanguageProfile] = {
     "en": LanguageProfile(
         code="en",
+        stt_language_codes=("en-US",),
         name="English",
         bcp47="en-US",
         greeting="Hi there, it's Avery calling to see how you're doing today.",
@@ -97,14 +118,30 @@ LANGUAGES: dict[str, LanguageProfile] = {
     ),
     "bn": LanguageProfile(
         code="bn",
+        stt_language_codes=("bn-BD", "en-US"),
         name="Bengali (Bangla)",
         bcp47="bn-BD",
         greeting="হ্যালো, আমি অ্যাভেরি বলছি। আজ আপনি কেমন আছেন, তাই জানতে ফোন করলাম।",
-        google_stt_model="default",
-        google_stt_streaming=False,
+        # Chirp3-HD (TTS_PROVIDER=google) doesn't have a bn-BD voice; bn-IN is
+        # the closest Chirp3-HD-covered Bengali locale. See google_tts_bcp47's
+        # docstring above.
+        google_tts_bcp47="bn-IN",
+        # Google's official v1 language table lists bn-BD under latest_long,
+        # not just default/command_and_search -- confirmed 2026-09-09 by two
+        # separate reads of the table (the earlier "latest_long doesn't cover
+        # Bengali" note was never actually confirmed by a live API error, only
+        # inferred from a less careful doc read). latest_long is the same
+        # model en/es already stream successfully on this deployment, so this
+        # is the one real chance to fix both the accuracy and the "waits
+        # until you stop talking" latency in one change. Needs a live call to
+        # confirm; if it's wrong, Google's API should reject it cleanly and
+        # the previous default/False pairing is the known-safe fallback.
+        google_stt_model="latest_long",
+        google_stt_streaming=True,
     ),
     "es": LanguageProfile(
         code="es",
+        stt_language_codes=("es-US", "en-US"),
         name="Spanish",
         bcp47="es-US",
         greeting="Hola, soy Avery. Te llamo para ver cómo estás hoy.",
@@ -112,24 +149,37 @@ LANGUAGES: dict[str, LanguageProfile] = {
     ),
     "ar": LanguageProfile(
         code="ar",
+        stt_language_codes=("ar-EG", "en-US"),
         name="Arabic",
         bcp47="ar-EG",
         greeting="مرحباً، معك أيفري. اتصلت لأطمئن عليك اليوم.",
-        # Not separately re-tested on a live call, but it shares Bengali's
-        # situation exactly: a non-latest_long v1 model, and latest_long is the
-        # only one observed to stream properly here. Flip to True and retest if
-        # Arabic turns out to stream fine.
-        google_stt_model="default",
-        google_stt_streaming=False,
+        # Chirp3-HD (TTS_PROVIDER=google) doesn't have an ar-EG voice; ar-XA
+        # ("Generic Arabic") is the Chirp3-HD-covered locale. See
+        # google_tts_bcp47's docstring above.
+        google_tts_bcp47="ar-XA",
+        # Same evidence and reasoning as Bengali above: Google's official v1
+        # table lists ar-EG under latest_long. Not yet live-tested for Arabic
+        # specifically.
+        google_stt_model="latest_long",
+        google_stt_streaming=True,
     ),
-    "ms": LanguageProfile(
-        code="ms",
-        name="Malay",
-        bcp47="ms-MY",
-        greeting="Hai, ini Avery. Saya menelefon untuk bertanya khabar hari ini.",
-        # Same reasoning as Bengali.
-        google_stt_model="default",
-        google_stt_streaming=False,
+    "hi": LanguageProfile(
+        code="hi",
+        stt_language_codes=("hi-IN", "en-US"),
+        name="Hindi",
+        bcp47="hi-IN",
+        greeting="नमस्ते, मैं एवरी बोल रही हूँ। आज आप कैसे हैं, यह जानने के लिए फोन किया है।",
+        # bn-BD and ar-EG are both confirmed on Google's official v1 table
+        # under latest_long (see above); hi-IN's row wasn't reachable in the
+        # same doc fetch (page truncated before the H's), but Hindi is one of
+        # Google's most broadly supported languages generally, so this is a
+        # reasonable bet rather than a confirmed fact -- lower confidence than
+        # bn/ar above. Revert to model="default", streaming=False (the
+        # previous, known-safe pairing) if a live call shows it's wrong.
+        # Hindi *is* in TURN_DETECTOR_LANGUAGES, so it gets real turn
+        # detection regardless of which STT model is used.
+        google_stt_model="latest_long",
+        google_stt_streaming=True,
     ),
 }
 
