@@ -637,11 +637,30 @@ These come from `ChatMessage.metrics`, not the older `metrics_collected` event, 
 
 This project has now lost several live calls to the same failure, across two different STT providers, and it looks identical every time: the caller talks, the agent says nothing, and **the log contains no error at all**. It is silent by construction — the ElevenLabs plugin emits a final transcript only when the committed text is non-empty, so an empty commit reaches the session as an end-of-speech with nothing attached, and the framework then declines to commit a turn because there is no transcript. Nothing in that chain raises.
 
-Two things now make it visible, so it never has to be diagnosed from a recording again:
+**As of 2026-09-10 the turn is recovered rather than just reported.** `src/stt_recovery.py` wraps the configured recognizer, keeps the current utterance's audio in memory, and watches for the two shapes this failure takes:
+
+- **Empty commit** — an end-of-speech arrives with no transcript attached. The connection is healthy; the recognizer just decided the audio was nothing.
+- **Silent stall** — no event of any kind for `STT_STALL_TIMEOUT_SECONDS` while the caller is mid-utterance. Measured on a live Bengali call: a 7-character partial, then nothing for ~16 seconds. The socket is wedged, so it is torn down and reopened as well.
+
+In both cases the buffered audio is re-recognized by `STT_FALLBACK_PROVIDER` and the result is emitted as a normal final transcript, so the turn commits and the agent replies about a second late instead of never. If both recognizers hear nothing in the same audio it is treated as real silence and no turn is invented — the one case where the agent staying quiet is correct.
+
+Note what this is *not*. `stt.FallbackAdapter` is also wired in (same fallback provider, one layer down) and handles the case where the primary **raises** — auth, quota, a socket it cannot re-establish. It cannot see this bug, because a recognizer answering "no speech" looks like a working recognizer to it. The two layers cover two genuinely different failures and neither replaces the other.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `STT_RECOVERY` | `1` | Master switch. `0` returns the bare provider with no fallback and no recovery — the pre-2026-09-10 behaviour |
+| `STT_FALLBACK_PROVIDER` | `google` | The recognizer that covers for the configured one, for both errors and dropped transcripts. Must be a *different* provider (a same-provider fallback is skipped with a warning); `none` disables the layer |
+| `STT_STALL_TIMEOUT_SECONDS` | `3.0` | Silence from the primary, mid-utterance, before its connection is treated as wedged. Keep it well above the ElevenLabs commit latency (`ELEVENLABS_STT_VAD_SILENCE_SECS` + `ELEVENLABS_STT_VAD_MIN_SILENCE_MS`, 1.1s by default) or it will fire on callers who simply pause |
+| `STT_RECOVERY_TIMEOUT_SECONDS` | `8.0` | Budget for the recovery recognition itself. A transcript arriving later than this lands in the wrong part of the conversation and is dropped |
+| `STT_STALL_MAX_UTTERANCE_SECONDS` | `30.0` | Cap on the audio buffered for one utterance |
+
+`STT stall:` and `STT stall recovered` in the worker log are what to grep for. One recovery in a call is the system working; recovery firing every few turns means the primary recognizer is the problem, not the recovery.
+
+Two things also make the failure visible, so it never has to be diagnosed from a recording again:
 
 - Every transcript is logged as it lands — `stt transcript is_final=True language=bn script=non-latin chars=34`. No lines at all means the recognizer is returning nothing.
 - **`script` is the field to trust, not `language`.** On an auto-detect connection the ElevenLabs plugin computes the language as `data.get("language_code", self._language)` and falls back to a hardcoded `"en"` when both are missing — and `self._language` is exactly `None` when detection is on. So a detecting connection reports `en` both when it really heard English and when the server said nothing at all. The script of the returned text cannot be faked that way: on a Bengali call, `script=latin` means no Bengali was produced regardless of what `language` claims. Set `LOG_TRANSCRIPT_TEXT=1` to log the text itself when you need to see it.
-- `TRANSCRIPTION_TIMEOUT_SECONDS` (default `6.0`) arms the framework's transcription-timeout signal, which is **disabled by default**. When VAD hears speech and no non-empty transcript follows, the worker logs a warning naming the language and the two env vars that fix it.
+- `TRANSCRIPTION_TIMEOUT_SECONDS` (default `6.0`) arms the framework's transcription-timeout signal, which is **disabled by default**. It now fires only when recovery *also* failed to save the turn — so it means "this turn is genuinely lost", not just "the primary dropped it". The warning points at the `STT stall` line above it, which says what recovery found.
 
 | Variable | Default | What it does |
 |---|---|---|

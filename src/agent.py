@@ -29,6 +29,7 @@ from livekit.agents import (
     inference,
     room_io,
 )
+from livekit.agents import stt as stt_module
 from livekit.plugins import (
     ai_coustics,
     cartesia,
@@ -47,6 +48,7 @@ from languages import (
     resolve_language,
 )
 from logging_utils import configure_logging
+from stt_recovery import StallRecoveringSTT
 
 # Structured (JSON) logs when LOG_FORMAT=json is set in the environment
 # (e.g. a production deployment); plain text otherwise, including LiveKit's
@@ -392,16 +394,20 @@ def _log_stt_diagnostics(
     def _on_transcription_timeout(ev: UserTranscriptionTimeoutEvent) -> None:
         logger.warning(
             "STT produced no transcript for %.1fs of detected speech on this "
-            "%s call. The caller is talking and the recognizer is returning "
-            "nothing, so no turn can commit and the agent will stay silent. "
-            "Check the 'elevenlabs STT language' line logged at session "
-            "start: if this language is pinned to a code the model cannot "
-            "serve, set ELEVENLABS_STT_LANGUAGE_%s=auto to let it detect, or "
-            "STT_PROVIDER_%s=google to fall back to a different recognizer.",
+            "%s call, and stall recovery did not save it either. This turn is "
+            "lost: no transcript means no turn commit, so the agent will stay "
+            "silent. Look just above this line -- a 'STT stall' entry says "
+            "recovery ran and what it found (nothing, an error, or a timeout), "
+            "and no such entry means the watchdog never armed, i.e. the "
+            "recognizer never even reported that speech had started. Check the "
+            "'STT for %s' line logged at session start for which recognizers "
+            "were actually in play; STT_PROVIDER_%s=%s moves this language onto "
+            "the fallback outright.",
             ev.speech_duration,
             profile.name,
+            profile.name,
             profile.code.upper(),
-            profile.code.upper(),
+            _stt_fallback_provider(),
             extra=extra,
         )
 
@@ -427,9 +433,24 @@ def _resolve_elevenlabs_language(profile: LanguageProfile) -> str | None:
     return raw
 
 
-def _build_stt(profile: LanguageProfile):
-    provider = _resolve_stt_provider(profile)
-    degraded = provider == "google" and not profile.google_stt_streaming
+def _build_stt(
+    profile: LanguageProfile,
+    provider: str | None = None,
+    *,
+    force_batch: bool = False,
+):
+    """Build one recognizer.
+
+    `provider` overrides the configured provider for this call only -- used to
+    build the fallback recognizer in _build_resilient_stt below, which has to
+    be a *different* provider from the one it is covering for. `force_batch`
+    builds the non-streaming variant, which is what the fallback wants: batch
+    recognition is a different code path from the realtime socket, so a wedged
+    socket cannot take it down too.
+    """
+    provider = (provider or _resolve_stt_provider(profile)).lower()
+    google_streaming = profile.google_stt_streaming and not force_batch
+    degraded = provider == "google" and not google_streaming and not force_batch
     if degraded:
         # Say this loudly and every call. It is the difference between "the
         # prompt needs work" and "the recognizer is the wrong one", and from
@@ -573,11 +594,137 @@ def _build_stt(profile: LanguageProfile):
             # framework segment audio with VAD and recognize each utterance as
             # it ends, instead of trusting a streaming recognizer that (for
             # some languages) returns nothing until the call is over.
-            use_streaming=profile.google_stt_streaming,
+            use_streaming=google_streaming,
         )
     raise ValueError(
         f"Unknown STT_PROVIDER: {provider!r} "
         "(expected 'gemini', 'google', or 'elevenlabs')"
+    )
+
+
+def _stt_fallback_provider() -> str:
+    """Which recognizer covers for the configured one.
+
+    Google Cloud Speech-to-Text by default: it authenticates with the same
+    silacares service account the LLM already uses -- no extra credential to
+    forget -- and it is a different vendor from the ElevenLabs default, so one
+    vendor's incident cannot take both down at once. "none" turns the whole
+    fallback layer off.
+    """
+    return os.environ.get("STT_FALLBACK_PROVIDER", "google").strip().lower()
+
+
+def _build_stt_fallback(profile: LanguageProfile, primary_provider: str):
+    """The second recognizer, or None if there shouldn't be one.
+
+    Returns None rather than raising when the fallback can't be built: a
+    missing fallback credential must never stop a call that the primary
+    recognizer could have served perfectly well.
+    """
+    provider = _stt_fallback_provider()
+    if provider in ("", "none", "off"):
+        return None
+    if provider == primary_provider:
+        # A fallback that shares the primary's connection, quota, region and
+        # outage is not a fallback.
+        logger.warning(
+            "STT_FALLBACK_PROVIDER is %r, the same provider already serving "
+            "%s. Skipping the fallback layer -- set it to a different provider "
+            "(or 'none' to silence this).",
+            provider,
+            profile.name,
+        )
+        return None
+    try:
+        return _build_stt(profile, provider, force_batch=True)
+    except Exception as exc:
+        logger.warning(
+            "could not build the %s STT fallback for %s (%s). The call will "
+            "run on %s alone, with no recovery if it stalls.",
+            provider,
+            profile.name,
+            exc,
+            primary_provider,
+        )
+        return None
+
+
+def _build_resilient_stt(profile: LanguageProfile, *, vad, call_id: str | None = None):
+    """The recognizer the session actually gets: the configured provider, plus
+    two layers of cover for the two ways it fails.
+
+    Layer 1, `stt.FallbackAdapter`: the primary raises -- auth, quota, a
+    dropped socket it can't re-establish -- and traffic moves to the fallback
+    for the rest of the call. This is the framework's own mechanism and it
+    only ever triggers on an *exception*.
+
+    Layer 2, `StallRecoveringSTT`: the primary raises nothing and returns
+    nothing. That is this project's actual recurring bug (see
+    src/stt_recovery.py for why it is invisible), and layer 1 cannot see it,
+    because from the adapter's point of view a recognizer that answers "no
+    speech" is working correctly. Layer 2 keeps the utterance's audio and
+    re-recognizes it through the fallback when the primary drops it.
+
+    STT_RECOVERY=0 disables both layers and returns the bare provider, which
+    is the pre-2026-09-10 behaviour.
+    """
+    primary_provider = _resolve_stt_provider(profile)
+    primary = _build_stt(profile, primary_provider)
+
+    if not _env_bool("STT_RECOVERY", True):
+        logger.warning(
+            "STT_RECOVERY=0: %s is running with no fallback and no stall "
+            "recovery. A dropped transcript will silently cost a turn.",
+            primary_provider,
+        )
+        return primary
+
+    fallback = _build_stt_fallback(profile, primary_provider)
+    if fallback is None:
+        return primary
+
+    if not primary.capabilities.streaming:
+        # StreamAdapter-wrapped recognizers are cut into utterances by the
+        # session's own VAD, so they cannot stall the way a realtime socket
+        # can. FallbackAdapter alone is the right amount of cover.
+        return stt_module.FallbackAdapter([primary, fallback], vad=vad)
+
+    def _on_recovery(reason: str, text: str) -> None:
+        logger.warning(
+            "recovered a dropped %s turn (%d chars) via %s: %s",
+            profile.name,
+            len(text),
+            _stt_fallback_provider(),
+            reason,
+            extra={"call_id": call_id},
+        )
+
+    logger.info(
+        "STT for %s: %s, with %s covering both errors and dropped transcripts",
+        profile.name,
+        primary_provider,
+        _stt_fallback_provider(),
+    )
+    # Two separate instances on purpose. The one inside FallbackAdapter gets
+    # wrapped in a StreamAdapter and driven as a stream; the recovery one is
+    # called with whole buffered utterances. Sharing a single object across
+    # both would work today but couples two very different call patterns to
+    # one plugin's internal state for no benefit.
+    return StallRecoveringSTT(
+        primary=stt_module.FallbackAdapter(
+            [primary, _build_stt(profile, _stt_fallback_provider(), force_batch=True)],
+            vad=vad,
+        ),
+        recovery=fallback,
+        # Three times the primary's own commit latency. ElevenLabs' server VAD
+        # finalizes at vad_silence_threshold_secs + min_silence_duration_ms
+        # (0.7s + 400ms here), so a healthy connection is never quiet this long
+        # mid-utterance. Raise it if recovery fires on callers who simply pause;
+        # the log line above says how often it fires.
+        stall_timeout=_env_float("STT_STALL_TIMEOUT_SECONDS", 3.0),
+        max_utterance_seconds=_env_float("STT_STALL_MAX_UTTERANCE_SECONDS", 30.0),
+        recovery_timeout=_env_float("STT_RECOVERY_TIMEOUT_SECONDS", 8.0),
+        on_recovery=_on_recovery,
     )
 
 
@@ -1311,6 +1458,8 @@ async def entrypoint(ctx: JobContext):
         extra={"call_id": call_id},
     )
 
+    vad = ctx.proc.userdata["vad"]
+
     llm = _build_llm()
     # Fire-and-forget: prewarm() schedules a background task and returns
     # immediately, so this overlaps with the SIP dial-out below instead of
@@ -1318,7 +1467,9 @@ async def entrypoint(ctx: JobContext):
     llm.prewarm()
 
     session = AgentSession(
-        stt=_build_stt(profile),
+        # Not _build_stt() directly: the session gets the recognizer plus its
+        # error fallback plus stall recovery. See _build_resilient_stt.
+        stt=_build_resilient_stt(profile, vad=vad, call_id=call_id),
         llm=llm,
         tts=_build_tts(profile),
         turn_handling=TurnHandlingOptions(
@@ -1374,7 +1525,7 @@ async def entrypoint(ctx: JobContext):
                 "discard_audio_if_uninterruptible": False,
             },
         ),
-        vad=ctx.proc.userdata["vad"],
+        vad=vad,
         # Off by default in the framework. Armed here because a recognizer
         # that returns nothing is this project's most expensive recurring
         # bug and its least visible one -- see _log_stt_diagnostics.

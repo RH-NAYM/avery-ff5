@@ -7,16 +7,17 @@ markdown or lists.
 
 import asyncio
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from livekit.agents import AgentSession, ChatContext, inference
+from livekit.agents import AgentSession, ChatContext, inference, stt
 from livekit.agents.evals import JudgeGroup, conciseness_judge, relevancy_judge
 
 import agent as agent_module
 from agent import ClosingAgent, DefaultAgent, on_session_end, summarize_session
 from languages import LANGUAGES, is_supported_language, resolve_language
+from stt_recovery import StallRecoveringSTT
 
 JUDGE_MODEL = "google/gemma-4-31b-it"
 
@@ -1105,3 +1106,129 @@ def test_script_of_names_the_alphabet_that_came_back(text: str, expected: str) -
     English. The script of the text is not ambiguous: on a Bengali call,
     "latin" means no Bengali was produced whatever the language field says."""
     assert agent_module._script_of(text) == expected
+
+
+# --- The recognizer stack the session actually gets --------------------------
+# _build_stt() builds one recognizer; _build_resilient_stt() is what the
+# session is handed, and it wraps that recognizer in two layers of cover for
+# the two distinct ways STT fails on this project. The tests above pin the
+# individual plugin arguments; these pin the shape of the stack, which is what
+# decides whether a dropped turn is recoverable at all.
+
+
+class _FakeSTT(stt.STT):
+    def __init__(self, *, streaming: bool = True, **kwargs) -> None:
+        super().__init__(
+            capabilities=stt.STTCapabilities(streaming=streaming, interim_results=True)
+        )
+        self.kwargs = kwargs
+
+    async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
+        raise NotImplementedError
+
+
+def _fake_plugins():
+    """Stand-ins for the real plugins, honouring the one capability the
+    composition actually branches on."""
+
+    def elevenlabs_stt(**kwargs):
+        return _FakeSTT(streaming=True, **kwargs)
+
+    def google_stt(**kwargs):
+        return _FakeSTT(streaming=kwargs.get("use_streaming", True), **kwargs)
+
+    return elevenlabs_stt, google_stt
+
+
+def _build_session_stt(code: str = "bn", **env):
+    elevenlabs_stt, google_stt = _fake_plugins()
+    environ = {
+        "ELEVENLABS_API_KEY": "k",
+        "GOOGLE_APPLICATION_CREDENTIALS": "creds.json",
+    }
+    environ.update(env)
+    with (
+        patch.dict("os.environ", environ),
+        patch.object(agent_module.elevenlabs, "STT", elevenlabs_stt),
+        patch.object(agent_module.google, "STT", google_stt),
+    ):
+        return agent_module._build_resilient_stt(LANGUAGES[code], vad=MagicMock())
+
+
+def test_the_session_recognizer_covers_both_stalls_and_errors() -> None:
+    built = _build_session_stt(STT_PROVIDER="elevenlabs")
+
+    # Outer layer: silent stalls. This is the failure that has actually cost
+    # this project live calls -- the recognizer returns nothing, raises
+    # nothing, and FallbackAdapter therefore never fires.
+    assert isinstance(built, StallRecoveringSTT)
+    # Inner layer: errors, handled by the framework's own adapter.
+    assert isinstance(built.primary, stt.FallbackAdapter)
+    assert len(built.primary._stt_instances) == 2
+
+    # The recovery recognizer must be a *batch* one. Re-recognizing buffered
+    # audio over a second realtime socket would share the code path that just
+    # stalled, which is the one thing it cannot do.
+    assert built.recovery.capabilities.streaming is False
+    assert built.recovery.kwargs["model"] == "latest_long"
+    assert built.recovery.kwargs["languages"] == ["bn-BD", "en-US"]
+
+
+def test_the_fallback_recognizer_is_a_different_vendor_from_the_primary() -> None:
+    built = _build_session_stt(STT_PROVIDER="elevenlabs")
+    # The point of a fallback is that it doesn't share the primary's outage,
+    # so it must not be reachable through the same connection or credential.
+    assert "server_vad" not in built.recovery.kwargs  # not the ElevenLabs plugin
+    assert built.recovery.kwargs["credentials_file"] == "creds.json"
+
+
+def test_the_fallback_is_skipped_when_it_would_be_the_same_provider() -> None:
+    built = _build_session_stt(STT_PROVIDER="google", STT_FALLBACK_PROVIDER="google")
+    # A "fallback" sharing the primary's quota, region and outage is not one,
+    # and pretending otherwise would be worse than having none.
+    assert isinstance(built, _FakeSTT)
+
+
+def test_stt_recovery_can_be_turned_off_entirely() -> None:
+    built = _build_session_stt(STT_PROVIDER="elevenlabs", STT_RECOVERY="0")
+    assert isinstance(built, _FakeSTT)
+    assert built.kwargs["model"] == "scribe_v2_realtime"
+
+
+def test_the_fallback_provider_is_configurable() -> None:
+    built = _build_session_stt(
+        STT_PROVIDER="google", STT_FALLBACK_PROVIDER="elevenlabs"
+    )
+    assert isinstance(built, StallRecoveringSTT)
+    assert built.recovery.kwargs["model"] == "scribe_v2_realtime"
+
+
+def test_a_missing_fallback_credential_does_not_break_the_call() -> None:
+    # The fallback exists to make calls more reliable. A fallback that can't
+    # be built taking the call down with it would be strictly worse than not
+    # having one.
+    elevenlabs_stt, _ = _fake_plugins()
+
+    def broken_google(**kwargs):
+        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set")
+
+    with (
+        patch.dict(
+            "os.environ", {"STT_PROVIDER": "elevenlabs", "ELEVENLABS_API_KEY": "k"}
+        ),
+        patch.object(agent_module.elevenlabs, "STT", elevenlabs_stt),
+        patch.object(agent_module.google, "STT", broken_google),
+    ):
+        built = agent_module._build_resilient_stt(LANGUAGES["bn"], vad=MagicMock())
+
+    assert isinstance(built, _FakeSTT)
+    assert built.kwargs["model"] == "scribe_v2_realtime"
+
+
+@pytest.mark.parametrize("code", ["en", "bn", "es", "ar", "hi"])
+def test_every_language_gets_stall_recovery(code: str) -> None:
+    # Bengali is the language this bug was found on, but nothing about it is
+    # Bengali-specific -- an empty commit is an empty commit.
+    assert isinstance(
+        _build_session_stt(code, STT_PROVIDER="elevenlabs"), StallRecoveringSTT
+    )
