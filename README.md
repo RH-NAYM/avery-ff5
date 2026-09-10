@@ -50,11 +50,15 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
      - `LIVEKIT_API_KEY`
      - `LIVEKIT_API_SECRET`
      - any provider API key listed in `.env.example` (realtime models are bring-your-own-key)
-     - if you're using Google (Gemini LLM/TTS, or `STT_PROVIDER`/`TTS_PROVIDER=google`) with a
-       **service account** instead of an API key, you only need to set
-       `GOOGLE_APPLICATION_CREDENTIALS` to the JSON key file's path — the project is
-       auto-inferred from the key file itself, and the Vertex AI location defaults to
-       `us-central1`. Leave the matching API key (`GEMINI_API_KEY`) blank to trigger this.
+     - if you're using Google (Gemini LLM/TTS, or `STT_PROVIDER=google` as a fallback
+       for the ElevenLabs default) with a **service account** instead of an API key,
+       you only need to set `GOOGLE_APPLICATION_CREDENTIALS` to the JSON key file's
+       path — the project is auto-inferred from the key file itself, and the Vertex
+       AI location defaults to `us-central1`. Leave the matching API key
+       (`GEMINI_API_KEY`) blank to trigger this.
+     - **speech recognition defaults to ElevenLabs** (`STT_PROVIDER=elevenlabs`), so
+       set `ELEVENLABS_API_KEY` too — see "Speech recognition" under "Language
+       support" below for why, and for the Google/Gemini STT fallbacks.
 
    - **Automatic setup** (recommended): Use the [LiveKit CLI](https://docs.livekit.io/intro/basics/cli/):
      ```bash
@@ -98,7 +102,13 @@ A voice AI project built with [LiveKit Agents for Python](https://github.com/liv
 
 This project can run entirely on your own machine, with a self-hosted LiveKit Server, and **without a LiveKit Cloud account**. The agent still talks to external AI providers directly, using your own credentials, instead of routing through [LiveKit Inference](https://docs.livekit.io/agents/models/inference).
 
-By default (`STT_PROVIDER`/`LLM_PROVIDER`/`TTS_PROVIDER=google`/`gemini`), that's a single Google Cloud service account covering all three stages via Vertex AI + Cloud Speech-to-Text:
+By default, `LLM_PROVIDER=gemini` uses a Google Cloud service account via
+Vertex AI, and `TTS_PROVIDER=google` uses the same service account for Google
+Cloud Text-to-Speech (chosen over `TTS_PROVIDER=gemini` because it streams
+synthesis — see ".env.local" for why the Gemini TTS path causes buffering
+pauses). STT defaults separately to ElevenLabs (`STT_PROVIDER=elevenlabs`,
+see "Speech recognition" under "Language support" for why) — set
+`GOOGLE_APPLICATION_CREDENTIALS` for LLM/TTS and `ELEVENLABS_API_KEY` for STT:
 
 ```text
 Local LiveKit Server (livekit-server --dev)
@@ -106,9 +116,9 @@ Local LiveKit Server (livekit-server --dev)
         ▼
 LiveKit Agent Worker (src/agent.py)
         │
-        ├── STT  → Google Cloud Speech-to-Text  (GOOGLE_APPLICATION_CREDENTIALS)
-        ├── LLM  → Gemini via Vertex AI          (GOOGLE_APPLICATION_CREDENTIALS)
-        └── TTS  → Gemini TTS via Vertex AI      (GOOGLE_APPLICATION_CREDENTIALS)
+        ├── STT  → ElevenLabs Scribe v2 Realtime (ELEVENLABS_API_KEY)
+        ├── LLM  → Gemini via Vertex AI           (GOOGLE_APPLICATION_CREDENTIALS)
+        └── TTS  → Gemini TTS via Vertex AI       (GOOGLE_APPLICATION_CREDENTIALS)
 ```
 
 Every stage is independently swappable to a different provider (ElevenLabs, Cartesia, OpenAI, ...) via its own `*_PROVIDER` env var - see `.env.example` for the full list.
@@ -303,6 +313,15 @@ python src/place_call.py +12135550100
 
 This dispatches the agent (`src/place_call.py`) into a new room with the phone number in the job's metadata. `entrypoint()` in `agent.py` reads `phone_number` from that metadata, dials out via `ctx.api.sip.create_sip_participant(...)` with `wait_until_answered=True`, and only starts the conversation once the call is answered. A busy signal, decline, or no-answer raises `api.SipCallError` and the job shuts down without starting a session — check the agent's logs for the SIP status code/reason.
 
+By default this uses Avery's built-in elder-companion persona (the same as a plain console/dev session). Pass `--prompt` (plus optional `--helper-prompt` and `--language`) to override the persona for that one call instead — the same override capability the outbound call API below has, without needing to run that whole service:
+
+```console
+python src/place_call.py +12135550100 \
+  --prompt "You are Avery, calling on behalf of Jane's son to check in." \
+  --helper-prompt "Jane prefers short calls and goes by 'Janie'." \
+  --language en
+```
+
 ### 4. Or trigger calls from a backend via the outbound call API
 
 `src/api.py` is a small FastAPI service for triggering a call from a real backend (a webhook, cron job, CRM integration) and getting a summary back once the conversation is over, instead of using the `place_call.py` CLI. Run it alongside the agent worker:
@@ -332,14 +351,327 @@ curl -X POST http://localhost:8000/calls/outbound \
   }'
 ```
 
-The request blocks until the call finishes (or `CALL_TIMEOUT_SECONDS`, default 900, elapses), then returns the same body with a `response_summary` field added. Unlike `place_call.py`'s fixed elder-companion persona, `prompt` here becomes the agent's full instructions for that call — `helper_prompt` is appended as supplementary context, and `langage` selects the STT/TTS language.
+This returns immediately (`202 Accepted`) with a `call_id` and `status: "pending"` — it does **not** block until the call finishes. An earlier version of this API held the HTTP connection open for up to `CALL_TIMEOUT_SECONDS` (default 900s / 15 minutes) per call, which doesn't scale under any real concurrency; poll for the result instead:
 
-Under the hood, `create_outbound_call` dispatches the agent with a `callback_url` in the job metadata pointing back at this API. When the conversation ends, the agent's `on_session_end` callback (in `agent.py`) summarizes `session.history` with a separate LLM call and POSTs it to that URL, which resolves the waiting request. Because that callback needs to reach this API's process, set `CALLBACK_BASE_URL` in `.env` (or the agent worker's environment) to wherever this API is actually reachable — the default `http://localhost:8000` only works when both processes share a host, which won't be true once the agent worker is deployed separately (for example, via `lk agent create`).
+```console
+curl http://localhost:8000/calls/<call_id>
+```
+
+which returns `status: "pending" | "completed" | "error" | "timeout"`, and once terminal, `response_summary` plus a structured `concern_level` (`"none"` / `"watch"` / `"urgent"`) and `flagged_topics` your backend can branch on without a human re-reading the summary — see `CallSummary` in `agent.py`. A call that's still `"pending"` after `CALL_TIMEOUT_SECONDS` (the agent worker crashed, got stuck, or its callback failed) is automatically marked `"timeout"`.
+
+Unlike `place_call.py`'s fixed elder-companion persona, `prompt` here becomes the agent's full instructions for that call — `helper_prompt` is appended as supplementary context, and `langage` selects the STT/TTS language.
+
+Under the hood, `create_outbound_call` dispatches the agent with a `callback_url` in the job metadata pointing back at this API. When the conversation ends, the agent's `on_session_end` callback (in `agent.py`) summarizes `session.history` with a separate, tool-forced LLM call and POSTs the structured result to that URL, which updates the stored call record for the next `GET /calls/<call_id>` to pick up. Because that callback needs to reach this API's process, set `CALLBACK_BASE_URL` in `.env` (or the agent worker's environment) to wherever this API is actually reachable — the default `http://localhost:8000` only works when both processes share a host, which won't be true once the agent worker is deployed separately (for example, via `lk agent create`).
 
 ### What's not covered here
 
 - **Inbound calls** (someone calls your Twilio number and reaches the agent) need an inbound SIP trunk and a [dispatch rule](https://docs.livekit.io/sip/dispatch-rule/) instead of explicit dispatch — see [Accepting inbound calls](https://docs.livekit.io/sip/accepting-calls/).
-- **Restart resilience / multiple API processes** — `api.py` tracks in-flight calls in an in-memory dict, so a restart loses them and it only works behind a single process. Move `_pending_calls` to a shared store (Redis, a database) if you need either.
+- **Restart resilience / multiple API processes** — `api.py` tracks call status in an in-memory dict, so a restart loses in-flight calls and it only works behind a single process. Move `_calls` to a shared store (Redis, a database) if you need either.
+- **Webhooks** — the caller has to poll `GET /calls/<call_id>` today; POSTing the result to a caller-supplied webhook URL instead would be a natural next step if polling doesn't fit your integration.
+
+## Language support
+
+The agent supports **English, Bengali (Bangla), Spanish, Arabic and Hindi**. The
+language is fixed for the whole call and comes from the `langage` field on
+`POST /calls/outbound`. Short codes (`bn`), locales (`bn-BD`) and English names
+(`bengali`) are all accepted; anything else is rejected with a `400` rather than
+silently downgraded to English.
+
+Everything a language needs lives in one row of `LANGUAGES` in
+`src/languages.py`: its STT locale, its recognition model, the opening line
+spoken on answer, and the English name used to steer the LLM. The persona
+instructions themselves stay in English on purpose — the model follows them
+fine, and one reviewable persona beats five translations that drift apart.
+
+> The bundled greetings were written to match the English one's tone. **Have a
+> native speaker review them before real calls** — it is the first thing an
+> elderly person hears. Override per call with the `greeting` field.
+
+### What each part of the pipeline covers
+
+| | en | es | ar | bn | hi |
+|---|---|---|---|---|---|
+| **STT** — ElevenLabs `scribe_v2_realtime` **(default for all five, 2026-09-09)** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Google `latest_long` (v1, streaming) — fallback (`STT_PROVIDER=google`) | ✅ | ✅ | ✅ | ✅ | ❔ |
+| **STT** — Google `default` (v1, VAD-segmented) — fallback if latest_long is wrong | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Google `chirp_2` (v2) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **STT** — Gemini `gemini-3.5-transcribe-live` — **currently broken on Vertex, see below** | ❔ | ❔ | ❔ | ❔ | ❔ |
+| **LLM** — Gemini 2.5 Flash | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **TTS** — Gemini (infers language from text) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Turn detector** — `inference.TurnDetector` | ✅ | ✅ | ✅ | ❌ | ✅ |
+
+Hindi's Google `latest_long` row is "❔" rather than "✅" because its row
+wasn't reachable in the doc fetch used to confirm bn/ar (the table is
+alphabetical and got cut off before H) — it's a reasonable bet given Hindi's
+generally strong Google support, not a confirmed fact the way bn/ar are. This
+only matters if you fall back to `STT_PROVIDER=google`; ElevenLabs' own
+documented coverage confirms all five languages directly, with per-language
+WER accuracy tiers (see "Speech recognition" below).
+
+### Speech recognition
+
+The default is **ElevenLabs `scribe_v2_realtime`** (`STT_PROVIDER=elevenlabs`,
+needs `ELEVENLABS_API_KEY`), as of 2026-09-09. It covers all five supported
+languages in one streaming model, and ElevenLabs' own documentation rates
+per-language WER accuracy as: English & Spanish "Excellent (≤5% WER)",
+Bengali & Hindi "High Accuracy (>5–10% WER)", Arabic "Good (>10–20% WER)".
+Override globally with `STT_PROVIDER`, or per language with `STT_PROVIDER_BN`
+and friends.
+
+**Why not Google, which was the default until now.** All five languages were
+moved to Google's `latest_long` v1 streaming model earlier the same day (see
+git history / project notes), reversing an earlier, never-actually-tested
+assumption that `latest_long` didn't cover Bengali. That fixed accuracy for
+one exchange on a live Bengali call — then the recognizer went completely
+silent for the rest of the call (no interim or final results, no error, no
+reconnect logged) until the caller hung up. Digging through the installed
+plugin's reconnect logic (5-minute session timer, gRPC 409 handling,
+confidence-threshold filtering) ruled out every documented cause without
+finding the real one. Rather than keep guessing and burning more live test
+calls, the default moved to a different STT engine entirely.
+`STT_PROVIDER=google` is still fully wired as a fallback if ElevenLabs turns
+out to have its own problems on a live call — see "Choosing an STT provider"
+below for the Google-specific model/region details.
+
+**Gemini live transcription (`gemini-3.5-transcribe-live`) would also cover
+all five languages natively and stream with interim results, and it reuses
+the same Vertex service account as the LLM/TTS** — but it is not currently
+usable on this deployment. Two separate live calls both failed identically:
+Vertex AI returned
+`Publisher model .../publishers/google/models/gemini-3.5-transcribe-live was
+not found`, once with `location="us-central1"` and once with
+`location="global"`. The same error in both locations rules out a location
+mistake — the model just isn't deployed as a Vertex publisher model on this
+project right now, most likely because it's still Gemini-Developer-API-only
+and hasn't rolled out to Vertex yet. Setting `GEMINI_API_KEY` (from
+[Google AI Studio](https://aistudio.google.com/), not a service account key)
+switches `STT_PROVIDER=gemini` onto that non-Vertex path instead — worth
+trying if you want a second fully-native-multilingual option, since the code
+path itself is fully wired and untouched by this issue.
+
+**English is always allowed alongside the call's language.** Each profile
+carries `stt_language_codes`, e.g. `("bn-BD", "en-US")`. Bangla, Hindi and
+Arabic speakers routinely drop English words mid-sentence — numbers, names,
+"doctor", "appointment" — and a recognizer locked to a single language turns
+those into the nearest native-sounding nonsense, which is then what the LLM has
+to reason about. English profiles list `("en-US",)` only. ElevenLabs itself
+takes a single bare language code (not a locale), so this code-switching list
+is Google-specific — the `elevenlabs` branch passes `profile.code` alone and
+relies on Scribe's own automatic language detection for any mid-sentence
+English.
+
+The worker states its choice at the start of every call:
+
+```
+using elevenlabs STT for Bengali (Bangla), expecting bn-BD/en-US
+```
+
+#### If you fall back to Google and a language ends up on the non-streaming path
+
+Two distinct Google streaming failures have been seen on live calls, in case
+`STT_PROVIDER=google` is ever used again:
+
+1. With `model="default"`, the v1 **streaming** recognizer returned no
+   interim and no final result for the whole call, then delivered the entire
+   conversation as one transcript the moment the caller hung up.
+2. With `model="latest_long"`, streaming worked correctly for one exchange
+   (fast, accurate) and then went completely silent — no interim or final
+   results, no error, no reconnect logged — for the rest of a ~94-second
+   call. Reading the installed plugin's reconnect logic ruled out the
+   5-minute session-timeout reconnect, a gRPC 409 stream-timeout, and
+   confidence-threshold filtering as the cause; none of them fit. Root cause
+   was never found. **This is the actual reason ElevenLabs is now the
+   default** rather than continuing to debug Google's v1 streaming path.
+
+If a language needs to fall back within Google itself (model rejected, or
+streaming returns nothing), set `google_stt_streaming=False` on its profile.
+This does **not** disable transcription: the plugin advertises itself as
+non-streaming and the framework wraps it in `stt.StreamAdapter`, segmenting
+on Silero VAD and recognizing each utterance as it ends — slower and it only
+starts once you stop talking, but it produces a turn. That path logs a loud
+warning every call, because "the recognizer is the wrong one" and "the
+prompt needs work" look identical from a transcript.
+
+`chirp_2` (v2) is the best classic-Google option but needs three things:
+`speech.googleapis.com` enabled (already true), the **Cloud Speech Client**
+role (`roles/speech.client`) on the service account — that is the permission
+that currently returns `403` — and a **non-global** `GOOGLE_STT_LOCATION`,
+since `chirp_2` runs only in `us-central1`, `europe-west4` and
+`asia-southeast1` and is Private GA.
+
+**Turn detection.** The audio turn detector covers 14 languages
+(`ar de en es fr hi id it ja ko nl pt tr zh`) — English, Spanish, Arabic and
+Hindi are all in that set. **Bengali is the only supported language it
+doesn't cover**, and it wasn't on the older text model either. Bengali calls
+fall back to VAD-only endpointing — they work, but turn-taking is less
+responsive, and the worker logs a warning saying so at the start of each such
+call.
+
+### Choosing an STT provider
+
+`STT_PROVIDER=elevenlabs` (the default) uses `scribe_v2_realtime`, which
+covers all five languages with one model and needs no Google IAM change --
+just `ELEVENLABS_API_KEY`. Note the model is `scribe_v2_realtime`, not the
+older `scribe_v1`, which is batch-only: on a live call that means no text
+exists until the caller has already stopped speaking.
+
+**`server_vad` is not optional here.** The connection is opened with
+`commit_strategy=manual` unless `server_vad` is passed, and in manual mode
+ElevenLabs' server only finalizes a transcript when the client sends an
+explicit commit -- which the installed plugin only does when its stream is
+flushed, and nothing in `livekit-agents`' `AudioRecognition` flushes a
+streaming STT mid-call (that's a `StreamAdapter`-only concept). Without it,
+confirmed on a live Bengali call: `partial_transcript` messages kept arriving
+and drifting/hallucinating for 40+ seconds after the caller spoke once,
+`committed_transcript` never arrived, and the agent never replied -- the
+caller saw the same "STT is getting everything wrong" symptom as before, for
+an unrelated reason. `_build_stt` always passes
+`server_vad={"vad_silence_threshold_secs": ..., "min_silence_duration_ms":
+...}`, defaulting to 1.5s / 800ms and overridable with
+`ELEVENLABS_STT_VAD_SILENCE_SECS` / `ELEVENLABS_STT_VAD_MIN_SILENCE_MS`.
+
+`STT_PROVIDER=google` uses the classic Cloud Speech recognizer as a fallback.
+The catch there is that the plugin picks the API version from the *model
+name* —
+
+```python
+return 2 if self.model in get_args(SpeechModelsV2) else 1   # v2: telephony, chirp_2, chirp_3
+```
+
+— so `latest_long` means the **v1** API. Every language currently defaults to
+`latest_long` (see "Speech recognition" above); `google_stt_model="default"`
+remains the fallback for a language `latest_long` turns out not to actually
+serve. Per-language overrides: `GOOGLE_STT_MODEL_BN`, `GOOGLE_STT_MODEL_HI`,
+etc., or `GOOGLE_STT_MODEL` to change them all at once.
+
+To use **`chirp_2`** instead (best multilingual accuracy) you need three things,
+not just one:
+
+1. `speech.googleapis.com` enabled on the project — already true, or English
+   wouldn't work today.
+2. The service account granted **Cloud Speech Client** (`roles/speech.client`),
+   which is what carries `speech.recognizers.recognize` — the permission that
+   currently returns `403`.
+3. A **non-global region**. `chirp_2` is not available in `global`; it runs in
+   `us-central1`, `europe-west4` and `asia-southeast1` only, and is Private GA,
+   so access has to be requested. Set `GOOGLE_STT_LOCATION` accordingly.
+
+### Voices
+
+A voice is not language-neutral: the default ElevenLabs voice is an English one
+and carries an English accent into every other language. Set a native voice per
+language with `ELEVENLABS_VOICE_ID_<CODE>` (e.g. `ELEVENLABS_VOICE_ID_BN`), or
+`GEMINI_TTS_VOICE_<CODE>` / `GOOGLE_TTS_VOICE_<CODE>` for those providers. The
+unsuffixed variables still apply as the fallback for any language without one.
+
+## Securing the completion callback
+
+`POST /internal/calls/{call_id}/completed` is how the agent worker reports a
+call's result. It is deliberately **not** in the OpenAPI schema or `/docs`:
+Swagger pre-fills string fields with `"string"`, so a single "Try it out" on it
+sends `error: "string"`, which marks a live call errored — and the worker's real
+result is then discarded as a duplicate callback.
+
+Hiding it is not access control. Set `CALLBACK_SECRET` to the same value in
+**both** the API's and the worker's environment, and the worker will send it as
+`X-Callback-Secret` while the API rejects anything else with a `401`:
+
+```bash
+CALLBACK_SECRET=$(openssl rand -hex 32)
+```
+
+Unset on both sides keeps the old unauthenticated behaviour, so nothing breaks
+if you skip this — but anyone who can reach the service and learn a `call_id`
+can otherwise finish or fail that call on the agent's behalf.
+
+## Call quality tuning (greeting latency and VAD)
+
+Two things dominate how a phone call *feels*: how fast the agent speaks after the callee picks up, and whether it reliably takes turns instead of talking over people or cutting itself off.
+
+**The opening line is spoken, not generated.** On answer the agent sends a known string straight to TTS rather than asking the LLM to compose a greeting, which removes a full model round trip from the start of every call. Precedence: `greeting` in the job metadata (the outbound call API's `greeting` field, or `place_call.py --greeting`) → the `AGENT_GREETING` environment variable → the built-in line in `agent.py`. A caller-supplied `prompt` with no `greeting` is the one case that still generates its opening line, since a fixed "calling to see how you're doing" would be wrong coming from an arbitrary persona — pass a `greeting` alongside a custom `prompt` to get the fast path back.
+
+On phone calls the greeting is also **uninterruptible**, so line noise at pickup can't kill it mid-word; anything the callee says over it (people answer with "Hello?") is kept rather than discarded, and handled as soon as the greeting finishes. Console and web sessions keep an interruptible greeting.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AGENT_GREETING` | built-in line | Opening line for the default persona |
+| `SIP_GREETING_DELAY_SECONDS` | `0.25` | Pause after answer before speaking, so a carrier that completes signalling just before the media path is live doesn't clip the first syllable |
+| `VAD_MIN_SPEECH_DURATION` | `0.15` | Speech must last this long to start a turn. Silero's stock `0.05` lets a line pop or a key click register as speech |
+| `VAD_MIN_SILENCE_DURATION` | `0.65` | Pause before a turn is considered over. Above stock, because elderly callers pause mid-thought and being cut off is worse than a slightly later reply |
+| `VAD_ACTIVATION_THRESHOLD` | `0.6` | Above stock `0.5`, which fires on a phone line's noise floor |
+| `VAD_DEACTIVATION_THRESHOLD` | `0.35` | Deliberately far below activation. This hysteresis band keeps a turn alive through the quiet dips inside normal speech instead of flickering |
+| `VAD_PREFIX_PADDING_DURATION` | `0.5` | Audio kept from just before detection so STT hears the word onset |
+| `VAD_SAMPLE_RATE` | `16000` | Silero also ships an 8kHz variant matching telephony's native rate; a phone-only deployment can try `8000` |
+| `INTERRUPTION_MIN_WORDS` | `1` | Words that must actually transcribe before the agent stops talking. The stock `0` means any accepted burst of audio — a television, a cough — cuts it off |
+| `INTERRUPTION_MIN_DURATION` | `0.6` | Minimum overlapping speech length to count as an interruption |
+| `PREEMPTIVE_TTS` | `1` | Synthesise before the turn is confirmed. Cuts latency, but wastes synthesis on false starts — set `0` first if calls still sound unstable after retuning the VAD |
+
+Retune against real call recordings rather than by feel: raise `VAD_ACTIVATION_THRESHOLD` and `VAD_MIN_SPEECH_DURATION` if the agent takes turns nobody started, and lower them if it misses quiet speakers.
+
+### Response latency: measure first, then tune
+
+Every turn logs its own latency, so a slow call can be diagnosed from the worker log instead of guessed at. Grep a call for `latency`:
+
+```
+turn user: transcription_delay=1.15s end_of_turn_delay=1.15s
+latency e2e=1.87s (llm_ttft=0.55s llm_ttfs=0.61s tts_ttfb=0.17s)
+```
+
+`e2e` is the framework's own measure of the gap between the caller finishing their sentence and the agent starting to reply — the thing a person on the phone actually experiences. The breakdown says which stage to go fix; whichever term dominates is the only one worth changing.
+
+These come from `ChatMessage.metrics`, not the older `metrics_collected` event, which is deprecated (the SDK warns on subscribe) and splits one turn across three separate callbacks.
+
+**Measured on a live Bengali call, 2026-09-09 (worker in Dhaka, LiveKit edge India South):** `e2e` ≈ 1.9s — `transcription_delay` ≈ 1.15s, `llm_ttft` ≈ 0.55s, `tts_ttfb` ≈ 0.17s. The recognizer is now the dominant term by a wide margin, and **the two ElevenLabs VAD numbers are additive**: `0.7s + 400ms = 1.1s`, against a measured 1.01–1.35s across eight turns. Cutting further means cutting that pair, at the cost of interrupting callers who pause mid-thought — a real trade-off for elderly callees, not a free win.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ELEVENLABS_STT_VAD_SILENCE_SECS` | `0.7` | How long ElevenLabs' server waits in silence before finalizing a transcript. **The single largest fixed cost in the pipeline** — no turn commits and no LLM call starts until it fires. Shows up as `transcription_delay` |
+| `ELEVENLABS_STT_VAD_MIN_SILENCE_MS` | `400` | The server-side VAD's own end-of-speech window, tuned alongside the above |
+| `ENDPOINTING_MIN_DELAY` | `0.5` | Normal wait after end-of-speech before the turn commits. Runs concurrently with the STT wait above, so the longer of the two is what you actually pay |
+| `ENDPOINTING_MAX_DELAY` | `1.5` | What the turn detector escalates to when it predicts the caller has *not* finished. Was `3.0`; at that value one uncertain prediction added over a second of silence, which a caller can't tell apart from the agent hanging up |
+| `GEMINI_THINKING_BUDGET` | `0` | Gemini 2.5 Flash reasons before answering unless told not to, and those tokens land entirely inside `llm_ttft`. `0` disables it; a positive number allows that many tokens; `-1` restores the model's own dynamic default |
+| `GEMINI_LOCATION` | *(unset → `us-central1`)* | Vertex AI region for the LLM. The plugin's default is `us-central1`, so a worker running in Asia pays a Pacific crossing on every streaming round trip. `.env.local` sets `asia-south1`; `global` is the safe fallback |
+| `GOOGLE_TTS_LOCATION` | `global` | Google Cloud TTS endpoint. A nearby region shortens `tts_ttfb`, but Chirp3-HD voices aren't offered everywhere and a region that lacks the voice fails the request outright — verify on a live call before keeping it |
+
+### When the agent never replies: the STT produced nothing
+
+This project has now lost several live calls to the same failure, across two different STT providers, and it looks identical every time: the caller talks, the agent says nothing, and **the log contains no error at all**. It is silent by construction — the ElevenLabs plugin emits a final transcript only when the committed text is non-empty, so an empty commit reaches the session as an end-of-speech with nothing attached, and the framework then declines to commit a turn because there is no transcript. Nothing in that chain raises.
+
+**As of 2026-09-10 the turn is recovered rather than just reported.** `src/stt_recovery.py` wraps the configured recognizer, keeps the current utterance's audio in memory, and watches for the two shapes this failure takes:
+
+- **Empty commit** — an end-of-speech arrives with no transcript attached. The connection is healthy; the recognizer just decided the audio was nothing.
+- **Silent stall** — no event of any kind for `STT_STALL_TIMEOUT_SECONDS` while the caller is mid-utterance. Measured on a live Bengali call: a 7-character partial, then nothing for ~16 seconds. The socket is wedged, so it is torn down and reopened as well.
+
+In both cases the buffered audio is re-recognized by `STT_FALLBACK_PROVIDER` and the result is emitted as a normal final transcript, so the turn commits and the agent replies about a second late instead of never. If both recognizers hear nothing in the same audio it is treated as real silence and no turn is invented — the one case where the agent staying quiet is correct.
+
+Note what this is *not*. `stt.FallbackAdapter` is also wired in (same fallback provider, one layer down) and handles the case where the primary **raises** — auth, quota, a socket it cannot re-establish. It cannot see this bug, because a recognizer answering "no speech" looks like a working recognizer to it. The two layers cover two genuinely different failures and neither replaces the other.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `STT_RECOVERY` | `1` | Master switch. `0` returns the bare provider with no fallback and no recovery — the pre-2026-09-10 behaviour |
+| `STT_FALLBACK_PROVIDER` | `google` | The recognizer that covers for the configured one, for both errors and dropped transcripts. Must be a *different* provider (a same-provider fallback is skipped with a warning); `none` disables the layer |
+| `STT_STALL_TIMEOUT_SECONDS` | `3.0` | Silence from the primary, mid-utterance, before its connection is treated as wedged. Keep it well above the ElevenLabs commit latency (`ELEVENLABS_STT_VAD_SILENCE_SECS` + `ELEVENLABS_STT_VAD_MIN_SILENCE_MS`, 1.1s by default) or it will fire on callers who simply pause |
+| `STT_RECOVERY_TIMEOUT_SECONDS` | `8.0` | Budget for the recovery recognition itself. A transcript arriving later than this lands in the wrong part of the conversation and is dropped |
+| `STT_STALL_MAX_UTTERANCE_SECONDS` | `30.0` | Cap on the audio buffered for one utterance |
+
+`STT stall:` and `STT stall recovered` in the worker log are what to grep for. One recovery in a call is the system working; recovery firing every few turns means the primary recognizer is the problem, not the recovery.
+
+Two things also make the failure visible, so it never has to be diagnosed from a recording again:
+
+- Every transcript is logged as it lands — `stt transcript is_final=True language=bn script=non-latin chars=34`. No lines at all means the recognizer is returning nothing.
+- **`script` is the field to trust, not `language`.** On an auto-detect connection the ElevenLabs plugin computes the language as `data.get("language_code", self._language)` and falls back to a hardcoded `"en"` when both are missing — and `self._language` is exactly `None` when detection is on. So a detecting connection reports `en` both when it really heard English and when the server said nothing at all. The script of the returned text cannot be faked that way: on a Bengali call, `script=latin` means no Bengali was produced regardless of what `language` claims. Set `LOG_TRANSCRIPT_TEXT=1` to log the text itself when you need to see it.
+- `TRANSCRIPTION_TIMEOUT_SECONDS` (default `6.0`) arms the framework's transcription-timeout signal, which is **disabled by default**. It now fires only when recovery *also* failed to save the turn — so it means "this turn is genuinely lost", not just "the primary dropped it". The warning points at the `STT stall` line above it, which says what recovery found.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ELEVENLABS_STT_LANGUAGE_<CODE>` | the language's own code, except `bn` | ISO-639 code to pin the connection to, or `auto` to let ElevenLabs detect. Detection is only requested when no code is sent, so `auto` is the only way to get it |
+| `ELEVENLABS_STT_LANGUAGE` | — | Same, applied to every language |
+| `TRANSCRIPTION_TIMEOUT_SECONDS` | `6.0` | Untranscribed speech before the warning fires. Empty to disable |
+| `LOG_TRANSCRIPT_TEXT` | `0` | Log the transcript text itself, not just its length and script. Off by default — it is the caller's own words |
+
+**Bengali defaults to auto-detect.** Pinning `language_code=bn` produced no transcript on a live call while English — same pipeline, same server-VAD settings, same build — worked. Auto-detect also matches what this profile's `stt_language_codes` has always described and the ElevenLabs path otherwise ignored: Bengali speakers drop English words mid-sentence, and a connection pinned to one code cannot represent that. `ELEVENLABS_STT_LANGUAGE_BN=bn` pins it back. If auto-detect also produces nothing, the recognizer is the problem rather than the code — `STT_PROVIDER_BN=google` moves that one language onto a different one without touching the other four.
+
+**Where the worker runs matters as much as any of these.** Running `dev` on a laptop outside the region of ElevenLabs, Vertex and LiveKit's inference gateway adds a round trip to every one of those hops, several times per turn. If the numbers above look good and calls still feel slow, deploy the agent (`lk agent deploy`, see `livekit.toml`) and compare the same log lines from there.
 
 ## Customize your agent
 
@@ -402,17 +734,32 @@ If you don't alread have a frontend, use the following templates and guides to g
 
 ## Observability
 
-LiveKit provides deep session insights for your agents through [Agent Observability](https://docs.livekit.io/deploy/observability/). Monitor conversation quality, track latency metrics, and debug agent behavior in production.
+LiveKit provides deep session insights for your agents through [Agent Observability](https://docs.livekit.io/deploy/observability/). Monitor conversation quality, track latency metrics, and debug agent behavior in production. That covers the voice pipeline itself; the outbound-call API (`src/api.py`) is a separate service with its own observability:
+
+- **Metrics**: `GET /metrics` on the API exposes Prometheus-format counters/histograms (`avery_calls_created_total`, `avery_calls_completed_total{status=...}`, `avery_call_duration_seconds`) — point a Prometheus instance (self-hosted, or a SaaS like Grafana Cloud) at it. Nothing to configure; the endpoint is always on.
+- **Tracing**: set `OTEL_EXPORTER_OTLP_ENDPOINT` to send OpenTelemetry traces for the call-dispatch lifecycle to any OTLP-compatible collector (self-hosted Jaeger/Tempo/Grafana, or a SaaS). Unset, tracing is a no-op — this is opt-in, not a new requirement.
+- **Logs**: both `agent.py` and `api.py` log plain text by default. Set `LOG_FORMAT=json` in a deployment's environment for structured, one-JSON-object-per-line logs (see `src/logging_utils.py`) — useful for correlating a call across both processes by `call_id`, or feeding a log aggregator.
+
+None of the above requires a new purchase: Prometheus, an OTLP collector, and JSON log shipping can all be run yourself for free. They're also all designed to work with a paid/hosted equivalent (Grafana Cloud, Datadog, Honeycomb, etc.) if you'd rather not run the infrastructure — that's an operational choice, not something this code assumes either way.
 
 ## Deploy to production
 
-To deploy your agent to production, you can use the LiveKit CLI:
+**Agent worker** (`src/agent.py`) — use the LiveKit CLI:
 
 ```console
 lk agent create
 ```
 
 See the [deploying to production](https://docs.livekit.io/deploy/agents/) guide for detailed instructions and optimization tips.
+
+**Outbound call API** (`src/api.py`) — this is a separate service from the agent worker and isn't covered by `lk agent create`. Build it from the Dockerfile's dedicated `api` stage (a plain `docker build .` still builds the agent worker unchanged, as before):
+
+```console
+docker build --target api -t avery-api .
+docker run --env-file .env.local -p 8000:8000 avery-api
+```
+
+Deploy the resulting image anywhere that runs a container (it's a standard stateless FastAPI/uvicorn service) — a VM, ECS/Cloud Run/Fly.io/Render, or your existing container platform. It needs `LIVEKIT_URL`/`LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` and `CALLBACK_BASE_URL` set to wherever it's actually reachable from the agent worker; see the "Outbound Phone Calls" section above for the rest of its configuration.
 
 ## Join the LiveKit community
 
