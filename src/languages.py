@@ -91,6 +91,28 @@ class LanguageProfile:
     name (v2 for telephony/chirp_2/chirp_3, v1 otherwise), so this field
     decides both. Override per language with GOOGLE_STT_MODEL_<CODE>."""
 
+    elevenlabs_language_code: str | None = None
+    """Language code handed to ElevenLabs STT, when it should differ from
+    `code`, or the literal "auto" to send none at all.
+
+    ElevenLabs takes a bare ISO-639 code, not a locale, so `code` is the right
+    value for most languages. "auto" is different in kind: the plugin only
+    adds `include_language_detection=true` to the websocket URL when no
+    `language_code` is passed (see the elevenlabs plugin's `_connect_ws`), so
+    this is the only way to let the model decide.
+
+    That matters for Bengali specifically. Pinning `language_code=bn` produced
+    no transcript at all on a live call while English -- same pipeline, same
+    server-VAD settings, same build -- worked, and the failure is silent by
+    construction: the plugin emits a FINAL_TRANSCRIPT only when the committed
+    text is non-empty, so an empty commit reaches the session as an
+    end-of-speech with nothing attached and no error anywhere. Auto-detect
+    also matches what `stt_language_codes` has always described for this
+    profile, which the ElevenLabs branch otherwise ignores entirely --
+    Bengali speakers drop English words mid-sentence, and a connection pinned
+    to one code cannot represent that.
+    """
+
     google_tts_bcp47: str | None = None
     """Locale to hand Google Cloud TTS (TTS_PROVIDER=google) instead of
     `bcp47`, when they differ. Google's Chirp3-HD voices -- the named,
@@ -126,6 +148,10 @@ LANGUAGES: dict[str, LanguageProfile] = {
         # the closest Chirp3-HD-covered Bengali locale. See google_tts_bcp47's
         # docstring above.
         google_tts_bcp47="bn-IN",
+        # See elevenlabs_language_code's docstring: pinning "bn" produced no
+        # transcript on a live call while English worked. Override with
+        # ELEVENLABS_STT_LANGUAGE_BN=bn to go back to pinning it.
+        elevenlabs_language_code="auto",
         # Google's official v1 language table lists bn-BD under latest_long,
         # not just default/command_and_search -- confirmed 2026-09-09 by two
         # separate reads of the table (the earlier "latest_long doesn't cover

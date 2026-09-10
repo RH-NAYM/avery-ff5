@@ -654,9 +654,13 @@ def test_elevenlabs_stt_receives_the_call_language_and_a_streaming_model() -> No
     # (confirmed on a live Bengali call -- partial_transcript kept arriving
     # and drifting for 40+ seconds, committed_transcript never arrived, the
     # agent never replied). server_vad must always be passed.
+    # These values are a latency decision, not a style one: no turn can
+    # commit and no LLM call can start until ElevenLabs' server finalizes,
+    # so this wait is a hard floor under every single reply. Lowered from
+    # 1.5s/800ms on 2026-09-09.
     assert captured["server_vad"] == {
-        "vad_silence_threshold_secs": 1.5,
-        "min_silence_duration_ms": 800,
+        "vad_silence_threshold_secs": 0.7,
+        "min_silence_duration_ms": 400,
     }
 
 
@@ -904,3 +908,200 @@ def test_google_tts_falls_back_to_the_unsuffixed_voice_override(monkeypatch) -> 
         agent_module._build_tts(LANGUAGES["hi"])
 
     assert captured["voice_name"] == "en-US-Chirp3-HD-Leda"
+
+
+# ---------------------------------------------------------------------------
+# Latency: LLM thinking budget and Vertex region
+# ---------------------------------------------------------------------------
+
+
+def _captured_llm():
+    captured: dict = {}
+
+    def stub(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    return captured, stub
+
+
+def test_gemini_thinking_is_disabled_by_default(monkeypatch) -> None:
+    """Gemini 2.5 Flash reasons before answering unless told not to, and
+    those tokens land entirely inside time-to-first-token -- dead air on a
+    phone call. Nothing in the transcript shows it, so this is easy to
+    regress by simply dropping the argument again."""
+    captured, stub = _captured_llm()
+    monkeypatch.delenv("GEMINI_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    with patch.object(agent_module.google, "LLM", stub):
+        agent_module._build_llm()
+
+    assert captured["thinking_config"] == {"thinking_budget": 0}
+
+
+def test_gemini_thinking_budget_is_overridable(monkeypatch) -> None:
+    captured, stub = _captured_llm()
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GEMINI_THINKING_BUDGET", "512")
+    with patch.object(agent_module.google, "LLM", stub):
+        agent_module._build_llm()
+
+    assert captured["thinking_config"] == {"thinking_budget": 512}
+
+
+def test_a_negative_thinking_budget_restores_the_model_default(monkeypatch) -> None:
+    """-1 means "send no thinking_config at all", which is different from
+    sending a budget of 0 -- it hands the decision back to the model."""
+    captured, stub = _captured_llm()
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GEMINI_THINKING_BUDGET", "-1")
+    with patch.object(agent_module.google, "LLM", stub):
+        agent_module._build_llm()
+
+    assert captured["thinking_config"] is agent_module.NOT_GIVEN
+
+
+def test_gemini_location_is_passed_through_on_the_vertex_path(monkeypatch) -> None:
+    """The plugin's own default is us-central1, which from a worker outside
+    North America adds a Pacific crossing to every streaming round trip."""
+    captured, stub = _captured_llm()
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GEMINI_LOCATION", "asia-south1")
+    with patch.object(agent_module.google, "LLM", stub):
+        agent_module._build_llm()
+
+    assert captured["vertexai"] is True
+    assert captured["location"] == "asia-south1"
+
+
+def test_an_unset_gemini_location_leaves_the_plugin_default(monkeypatch) -> None:
+    captured, stub = _captured_llm()
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.delenv("GEMINI_LOCATION", raising=False)
+    with patch.object(agent_module.google, "LLM", stub):
+        agent_module._build_llm()
+
+    assert captured["location"] is agent_module.NOT_GIVEN
+
+
+# ---------------------------------------------------------------------------
+# ElevenLabs STT language pinning vs. auto-detect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("code", ["en", "es", "ar", "hi"])
+def test_elevenlabs_stt_pins_the_language_for_most_languages(code: str) -> None:
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ", {"STT_PROVIDER": "elevenlabs", "ELEVENLABS_API_KEY": "k"}
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES[code])
+
+    assert captured["language_code"] == code
+
+
+def test_bengali_lets_elevenlabs_detect_the_language() -> None:
+    """Regression test for a live Bengali call that produced no transcript at
+    all while English worked on the same build. The plugin only adds
+    include_language_detection=true when no language_code is passed, so None
+    here -- not the string "auto", and not "bn" -- is what actually reaches
+    the wire. The failure this guards against is silent: an empty committed
+    transcript emits no FINAL_TRANSCRIPT and raises nothing."""
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ", {"STT_PROVIDER": "elevenlabs", "ELEVENLABS_API_KEY": "k"}
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES["bn"])
+
+    assert captured["language_code"] is None
+
+
+def test_a_per_language_elevenlabs_code_can_pin_bengali_back() -> None:
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "STT_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "k",
+                "ELEVENLABS_STT_LANGUAGE_BN": "bn",
+            },
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES["bn"])
+
+    assert captured["language_code"] == "bn"
+
+
+@pytest.mark.parametrize("value", ["auto", "detect", "", "  AUTO  "])
+def test_auto_in_any_spelling_means_detect(value: str) -> None:
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "STT_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "k",
+                "ELEVENLABS_STT_LANGUAGE_HI": value,
+            },
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES["hi"])
+
+    assert captured["language_code"] is None
+
+
+def test_the_unsuffixed_elevenlabs_language_applies_to_every_language() -> None:
+    captured, stub = _captured_stt("elevenlabs")
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "STT_PROVIDER": "elevenlabs",
+                "ELEVENLABS_API_KEY": "k",
+                "ELEVENLABS_STT_LANGUAGE": "auto",
+            },
+        ),
+        patch.object(agent_module.elevenlabs, "STT", stub),
+    ):
+        agent_module._build_stt(LANGUAGES["en"])
+
+    assert captured["language_code"] is None
+
+
+# ---------------------------------------------------------------------------
+# Transcript script detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("আজ আপনি কেমন আছেন", "non-latin"),
+        ("ami bhalo achi", "latin"),
+        ("আমার doctor appointment", "mixed"),
+        ("مرحبا", "non-latin"),
+        ("...", "none"),
+        ("", "none"),
+    ],
+)
+def test_script_of_names_the_alphabet_that_came_back(text: str, expected: str) -> None:
+    """The language field on an auto-detect ElevenLabs connection is not
+    trustworthy -- the plugin falls back to a hardcoded "en" when the server
+    reports no language, which is indistinguishable from really hearing
+    English. The script of the text is not ambiguous: on a Bengali call,
+    "latin" means no Bengali was produced whatever the language field says."""
+    assert agent_module._script_of(text) == expected

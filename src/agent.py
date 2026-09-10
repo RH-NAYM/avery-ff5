@@ -18,9 +18,12 @@ from livekit.agents import (
     BackgroundAudioPlayer,
     BuiltinAudioClip,
     ChatContext,
+    ConversationItemAddedEvent,
     JobContext,
     JobProcess,
     TurnHandlingOptions,
+    UserInputTranscribedEvent,
+    UserTranscriptionTimeoutEvent,
     cli,
     function_tool,
     inference,
@@ -272,6 +275,158 @@ def _resolve_stt_provider(profile: LanguageProfile) -> str:
     return default
 
 
+def _log_turn_metrics(session: AgentSession, call_id: str | None) -> None:
+    """Emit one line per turn giving the caller-perceived response latency.
+
+    Reads `ChatMessage.metrics`, which the framework attaches to each item as
+    it lands. The older `metrics_collected` event carries the same numbers but
+    is deprecated (the SDK warns on subscribe) and splits one turn across three
+    separate callbacks, so a slow turn had to be reassembled by timestamp.
+
+    `e2e_latency` is the number to read: the framework defines it as the time
+    from the caller finishing their sentence to the agent beginning to
+    respond, which is exactly what a person on the phone experiences. The
+    stage breakdown after it says which part to go fix -- the user turn's
+    transcription/end-of-turn delays, then the assistant turn's LLM and TTS
+    first-byte times.
+    """
+
+    @session.on("conversation_item_added")
+    def _on_item(ev: ConversationItemAddedEvent) -> None:
+        item = ev.item
+        m = getattr(item, "metrics", None)
+        if not m:
+            return
+        extra = {"call_id": call_id}
+
+        if getattr(item, "role", None) == "user":
+            # Both are measured from the end of the caller's speech, and they
+            # overlap rather than stack: the endpointing delay runs while the
+            # STT is still deciding, so the larger one is what was actually
+            # paid. A transcription_delay that tracks end_of_turn_delay almost
+            # exactly means the recognizer is setting the pace.
+            logger.info(
+                "turn user: transcription_delay=%.2fs end_of_turn_delay=%.2fs",
+                m.get("transcription_delay", float("nan")),
+                m.get("end_of_turn_delay", float("nan")),
+                extra=extra,
+            )
+            return
+
+        logger.info(
+            "latency e2e=%.2fs (llm_ttft=%.2fs llm_ttfs=%.2fs tts_ttfb=%.2fs)",
+            m.get("e2e_latency", float("nan")),
+            m.get("llm_node_ttft", float("nan")),
+            m.get("llm_node_ttfs", float("nan")),
+            m.get("tts_node_ttfb", float("nan")),
+            extra=extra,
+        )
+
+
+def _script_of(text: str) -> str:
+    """Which alphabet the recognizer answered in: "latin", "non-latin",
+    "mixed", or "none". Cheap, language-agnostic, and unlike the reported
+    language code it cannot be faked by a default value."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return "none"
+    ascii_letters = sum(1 for c in letters if c.isascii())
+    if ascii_letters == len(letters):
+        return "latin"
+    if ascii_letters == 0:
+        return "non-latin"
+    return "mixed"
+
+
+def _log_stt_diagnostics(
+    session: AgentSession, profile: LanguageProfile, call_id: str | None
+) -> None:
+    """Make "the STT produced nothing" visible while the call is happening.
+
+    This failure has now cost several live calls across two providers, and
+    every time it looked identical from the outside: the caller talks, the
+    agent says nothing, and the log contains no error. It is silent by
+    construction. The ElevenLabs plugin emits a FINAL_TRANSCRIPT only when
+    the committed text is non-empty (see its `_process_stream_event`), so an
+    empty commit arrives as an end-of-speech with nothing attached; the
+    framework's `_run_eou_detection` then returns early because there is no
+    transcript, and no turn is ever committed. Nothing in that chain raises,
+    so nothing gets logged.
+
+    Two handlers close that gap. The first prints every transcript as it
+    lands, so "is the recognizer producing anything at all, and in which
+    language" is answerable from the log instead of from a recording. The
+    second is the framework's own transcription-timeout signal, armed in
+    AgentSession below -- VAD heard speech, the turn ended, and no non-empty
+    final transcript ever arrived. That is exactly this bug, and it is off
+    by default.
+    """
+    extra = {"call_id": call_id}
+
+    log_text = _env_bool("LOG_TRANSCRIPT_TEXT", False)
+
+    @session.on("user_input_transcribed")
+    def _on_transcript(ev: UserInputTranscribedEvent) -> None:
+        # `language` cannot be trusted on an auto-detect connection. The
+        # ElevenLabs plugin computes it as
+        # `data.get("language_code", self._language)` and then falls back to
+        # a hardcoded LanguageCode("en") when both are absent -- and
+        # `self._language` is exactly None when we asked it to detect. So a
+        # detecting connection reports "en" both when it really heard English
+        # and when the server said nothing about the language at all.
+        #
+        # The script of the returned text is not ambiguous. On a Bengali call
+        # `script=latin` means the recognizer produced no Bengali, whatever
+        # the language field claims.
+        logger.info(
+            "stt transcript is_final=%s language=%s script=%s chars=%d%s",
+            ev.is_final,
+            ev.language or "?",
+            _script_of(ev.transcript or ""),
+            len(ev.transcript or ""),
+            f" text={ev.transcript!r}" if log_text else "",
+            extra=extra,
+        )
+
+    @session.on("user_transcription_timeout")
+    def _on_transcription_timeout(ev: UserTranscriptionTimeoutEvent) -> None:
+        logger.warning(
+            "STT produced no transcript for %.1fs of detected speech on this "
+            "%s call. The caller is talking and the recognizer is returning "
+            "nothing, so no turn can commit and the agent will stay silent. "
+            "Check the 'elevenlabs STT language' line logged at session "
+            "start: if this language is pinned to a code the model cannot "
+            "serve, set ELEVENLABS_STT_LANGUAGE_%s=auto to let it detect, or "
+            "STT_PROVIDER_%s=google to fall back to a different recognizer.",
+            ev.speech_duration,
+            profile.name,
+            profile.code.upper(),
+            profile.code.upper(),
+            extra=extra,
+        )
+
+
+def _resolve_elevenlabs_language(profile: LanguageProfile) -> str | None:
+    """The language code to pin the ElevenLabs connection to, or None to let
+    the model detect it.
+
+    Precedence: ELEVENLABS_STT_LANGUAGE_<CODE> -> ELEVENLABS_STT_LANGUAGE ->
+    the profile's own elevenlabs_language_code -> the profile code. "auto"
+    (or an explicitly empty value) at any level means "detect", which is not
+    the same as leaving the variable unset -- returning None here is what
+    makes the plugin add include_language_detection=true to the websocket.
+    """
+    raw = os.environ.get(f"ELEVENLABS_STT_LANGUAGE_{profile.code.upper()}")
+    if raw is None:
+        raw = os.environ.get("ELEVENLABS_STT_LANGUAGE")
+    if raw is None:
+        raw = profile.elevenlabs_language_code or profile.code
+    raw = raw.strip()
+    if raw.lower() in ("", "auto", "detect"):
+        return None
+    return raw
+
+
 def _build_stt(profile: LanguageProfile):
     provider = _resolve_stt_provider(profile)
     degraded = provider == "google" and not profile.google_stt_streaming
@@ -353,20 +508,40 @@ def _build_stt(profile: LanguageProfile):
         # produced a reply. Passing server_vad switches the connection to
         # commit_strategy=vad, which makes ElevenLabs' own server finalize on
         # silence the way every other streaming STT here already does.
-        vad_silence_threshold_secs = _env_float("ELEVENLABS_STT_VAD_SILENCE_SECS", 1.5)
-        vad_min_silence_duration_ms = _env_int("ELEVENLABS_STT_VAD_MIN_SILENCE_MS", 800)
+        # These two numbers sit directly on the critical path of every
+        # single turn, and they are the largest fixed cost in the pipeline.
+        # AudioRecognition._run_eou_detection returns early while there is no
+        # *final* transcript ("stt enabled but no transcript yet"), so the
+        # turn cannot commit -- and the LLM cannot start -- until ElevenLabs'
+        # server decides the caller has stopped. The endpointing delay below
+        # is measured from end-of-speech and runs concurrently with this
+        # wait, so whichever is longer is what the caller actually hears.
+        # At the previous 1.5s that was always this one, which put a hard
+        # ~1.5s floor under every reply before any model had been called.
+        # 0.7s still comfortably clears a mid-sentence breath (Silero's own
+        # VAD_MIN_SILENCE_DURATION is 0.65s) while giving that time back.
+        vad_silence_threshold_secs = _env_float("ELEVENLABS_STT_VAD_SILENCE_SECS", 0.7)
+        vad_min_silence_duration_ms = _env_int("ELEVENLABS_STT_VAD_MIN_SILENCE_MS", 400)
+        # ISO-639 here, not the BCP-47 locale: ElevenLabs takes a bare
+        # language code and would reject "bn-BD". Google is the opposite --
+        # region genuinely changes the recognition target there. None means
+        # auto-detect; see _resolve_elevenlabs_language.
+        el_language = _resolve_elevenlabs_language(profile)
+        logger.info(
+            "elevenlabs STT language for %s: %s",
+            profile.name,
+            el_language or "auto-detect",
+        )
         return elevenlabs.STT(
             api_key=_require_env("ELEVENLABS_API_KEY"),
             model=os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2_realtime"),
-            # ISO-639 here, not the BCP-47 locale: ElevenLabs takes a bare
-            # language code and would reject "bn-BD". Google is the opposite --
-            # region genuinely changes the recognition target there.
-            language_code=profile.code,
+            language_code=el_language,
             server_vad={
                 "vad_silence_threshold_secs": vad_silence_threshold_secs,
                 # ElevenLabs' own default (2500ms) is sluggish for a phone
-                # call -- 800ms roughly matches VAD_MIN_SILENCE_DURATION used
-                # for the session's own turn-taking VAD below.
+                # call. Raise this pair together if the agent starts talking
+                # over people who pause mid-thought; lower it if replies
+                # still feel late after checking the eou_delay metric.
                 "min_silence_duration_ms": vad_min_silence_duration_ms,
             },
         )
@@ -406,21 +581,56 @@ def _build_stt(profile: LanguageProfile):
     )
 
 
+def _gemini_thinking_config():
+    """Thinking budget for Gemini, defaulting to *off*.
+
+    Gemini 2.5 Flash ships with dynamic thinking enabled: given no
+    thinking_config at all, the model spends reasoning tokens before it
+    emits the first token of its answer. Those tokens are invisible in the
+    transcript but not in the call -- they land entirely inside
+    time-to-first-token, which on a voice call is dead air with a person
+    holding a phone to their ear. A warm check-in reply ("that sounds
+    tiring, did you manage to eat something?") needs no deliberation, so
+    the budget buys nothing here and costs one to two seconds a turn.
+
+    GEMINI_THINKING_BUDGET is the escape hatch: a positive token budget to
+    allow some thinking, or -1 to send nothing and restore the model's own
+    dynamic default. 0 (the default here) disables it explicitly.
+    """
+    budget = _env_int("GEMINI_THINKING_BUDGET", 0)
+    if budget < 0:
+        return NOT_GIVEN
+    return {"thinking_budget": budget}
+
+
 def _build_llm():
     provider = os.environ.get("LLM_PROVIDER", "gemini").lower()
     if provider == "gemini":
         api_key = os.environ.get("GEMINI_API_KEY")
+        thinking_config = _gemini_thinking_config()
         if api_key:
             return google.LLM(
                 model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
                 api_key=api_key,
+                thinking_config=thinking_config,
             )
         # No API key: fall back to Vertex AI using a Google Cloud service
         # account (GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_CLOUD_PROJECT /
         # GOOGLE_CLOUD_LOCATION), same credentials as STT_PROVIDER=google.
+        #
+        # The region is worth setting deliberately. The plugin defaults to
+        # us-central1 (llm.py: `os.environ.get("GOOGLE_CLOUD_LOCATION") or
+        # "us-central1"`), which for a worker running anywhere in South or
+        # Southeast Asia means every streaming round trip crosses the
+        # Pacific -- roughly 200ms of pure travel time per turn, on top of
+        # whatever the model itself takes. GEMINI_LOCATION overrides it
+        # without touching GOOGLE_CLOUD_LOCATION, which the STT and TTS
+        # paths also read.
         return google.LLM(
             model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
             vertexai=True,
+            location=os.environ.get("GEMINI_LOCATION") or NOT_GIVEN,
+            thinking_config=thinking_config,
         )
     if provider == "openai":
         return openai.LLM(
@@ -502,6 +712,16 @@ def _build_tts(profile: LanguageProfile):
             voice_name=os.environ.get(f"GOOGLE_TTS_VOICE_{profile.code.upper()}")
             or os.environ.get("GOOGLE_TTS_VOICE")
             or NOT_GIVEN,
+            # "global" (the plugin default) resolves to
+            # texttospeech.googleapis.com; anything else becomes
+            # <location>-texttospeech.googleapis.com. A regional endpoint
+            # near the worker shortens the round trip that shows up as
+            # tts_ttfb in the latency logs -- but Chirp3-HD voices are not
+            # offered in every region, and a region that lacks the voice
+            # fails the request outright rather than degrading. Left on
+            # "global" for that reason; try a nearby region and watch
+            # tts_ttfb before keeping it.
+            location=os.environ.get("GOOGLE_TTS_LOCATION", "global"),
         )
     if provider == "coqui":
         # Local import: torch/coqui-tts are heavy, GPU-oriented dependencies
@@ -1106,7 +1326,19 @@ async def entrypoint(ctx: JobContext):
             # "dynamic" adapts the end-of-turn wait to each caller's actual
             # pause patterns instead of always waiting the full min_delay,
             # so replies come faster for callers who don't pause much.
-            endpointing={"mode": "dynamic", "min_delay": 0.5, "max_delay": 3.0},
+            # max_delay is what the turn detector escalates to when it
+            # thinks the caller has not finished ("unlikely" end of turn) --
+            # see _bounce_eou_task in the framework's audio_recognition.py,
+            # which then sleeps until that many seconds have passed since
+            # end-of-speech. At 3.0 a single uncertain prediction added well
+            # over a second of silence on top of an already-slow turn, and
+            # the caller has no way to tell that from the agent having
+            # hung up. 1.5 still gives a hesitant speaker room to continue.
+            endpointing={
+                "mode": "dynamic",
+                "min_delay": _env_float("ENDPOINTING_MIN_DELAY", 0.5),
+                "max_delay": _env_float("ENDPOINTING_MAX_DELAY", 1.5),
+            },
             preemptive_generation={
                 "enabled": True,
                 # Start TTS before the turn is fully confirmed, not just the
@@ -1143,7 +1375,14 @@ async def entrypoint(ctx: JobContext):
             },
         ),
         vad=ctx.proc.userdata["vad"],
+        # Off by default in the framework. Armed here because a recognizer
+        # that returns nothing is this project's most expensive recurring
+        # bug and its least visible one -- see _log_stt_diagnostics.
+        transcription_timeout=_env_float("TRANSCRIPTION_TIMEOUT_SECONDS", 6.0),
     )
+
+    _log_turn_metrics(session, call_id)
+    _log_stt_diagnostics(session, profile, call_id)
 
     room_options_kwargs = {}
     if _AI_COUSTICS_LICENSE_KEY:

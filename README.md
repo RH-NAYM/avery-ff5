@@ -608,6 +608,52 @@ On phone calls the greeting is also **uninterruptible**, so line noise at pickup
 
 Retune against real call recordings rather than by feel: raise `VAD_ACTIVATION_THRESHOLD` and `VAD_MIN_SPEECH_DURATION` if the agent takes turns nobody started, and lower them if it misses quiet speakers.
 
+### Response latency: measure first, then tune
+
+Every turn logs its own latency, so a slow call can be diagnosed from the worker log instead of guessed at. Grep a call for `latency`:
+
+```
+turn user: transcription_delay=1.15s end_of_turn_delay=1.15s
+latency e2e=1.87s (llm_ttft=0.55s llm_ttfs=0.61s tts_ttfb=0.17s)
+```
+
+`e2e` is the framework's own measure of the gap between the caller finishing their sentence and the agent starting to reply — the thing a person on the phone actually experiences. The breakdown says which stage to go fix; whichever term dominates is the only one worth changing.
+
+These come from `ChatMessage.metrics`, not the older `metrics_collected` event, which is deprecated (the SDK warns on subscribe) and splits one turn across three separate callbacks.
+
+**Measured on a live Bengali call, 2026-09-09 (worker in Dhaka, LiveKit edge India South):** `e2e` ≈ 1.9s — `transcription_delay` ≈ 1.15s, `llm_ttft` ≈ 0.55s, `tts_ttfb` ≈ 0.17s. The recognizer is now the dominant term by a wide margin, and **the two ElevenLabs VAD numbers are additive**: `0.7s + 400ms = 1.1s`, against a measured 1.01–1.35s across eight turns. Cutting further means cutting that pair, at the cost of interrupting callers who pause mid-thought — a real trade-off for elderly callees, not a free win.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ELEVENLABS_STT_VAD_SILENCE_SECS` | `0.7` | How long ElevenLabs' server waits in silence before finalizing a transcript. **The single largest fixed cost in the pipeline** — no turn commits and no LLM call starts until it fires. Shows up as `transcription_delay` |
+| `ELEVENLABS_STT_VAD_MIN_SILENCE_MS` | `400` | The server-side VAD's own end-of-speech window, tuned alongside the above |
+| `ENDPOINTING_MIN_DELAY` | `0.5` | Normal wait after end-of-speech before the turn commits. Runs concurrently with the STT wait above, so the longer of the two is what you actually pay |
+| `ENDPOINTING_MAX_DELAY` | `1.5` | What the turn detector escalates to when it predicts the caller has *not* finished. Was `3.0`; at that value one uncertain prediction added over a second of silence, which a caller can't tell apart from the agent hanging up |
+| `GEMINI_THINKING_BUDGET` | `0` | Gemini 2.5 Flash reasons before answering unless told not to, and those tokens land entirely inside `llm_ttft`. `0` disables it; a positive number allows that many tokens; `-1` restores the model's own dynamic default |
+| `GEMINI_LOCATION` | *(unset → `us-central1`)* | Vertex AI region for the LLM. The plugin's default is `us-central1`, so a worker running in Asia pays a Pacific crossing on every streaming round trip. `.env.local` sets `asia-south1`; `global` is the safe fallback |
+| `GOOGLE_TTS_LOCATION` | `global` | Google Cloud TTS endpoint. A nearby region shortens `tts_ttfb`, but Chirp3-HD voices aren't offered everywhere and a region that lacks the voice fails the request outright — verify on a live call before keeping it |
+
+### When the agent never replies: the STT produced nothing
+
+This project has now lost several live calls to the same failure, across two different STT providers, and it looks identical every time: the caller talks, the agent says nothing, and **the log contains no error at all**. It is silent by construction — the ElevenLabs plugin emits a final transcript only when the committed text is non-empty, so an empty commit reaches the session as an end-of-speech with nothing attached, and the framework then declines to commit a turn because there is no transcript. Nothing in that chain raises.
+
+Two things now make it visible, so it never has to be diagnosed from a recording again:
+
+- Every transcript is logged as it lands — `stt transcript is_final=True language=bn script=non-latin chars=34`. No lines at all means the recognizer is returning nothing.
+- **`script` is the field to trust, not `language`.** On an auto-detect connection the ElevenLabs plugin computes the language as `data.get("language_code", self._language)` and falls back to a hardcoded `"en"` when both are missing — and `self._language` is exactly `None` when detection is on. So a detecting connection reports `en` both when it really heard English and when the server said nothing at all. The script of the returned text cannot be faked that way: on a Bengali call, `script=latin` means no Bengali was produced regardless of what `language` claims. Set `LOG_TRANSCRIPT_TEXT=1` to log the text itself when you need to see it.
+- `TRANSCRIPTION_TIMEOUT_SECONDS` (default `6.0`) arms the framework's transcription-timeout signal, which is **disabled by default**. When VAD hears speech and no non-empty transcript follows, the worker logs a warning naming the language and the two env vars that fix it.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `ELEVENLABS_STT_LANGUAGE_<CODE>` | the language's own code, except `bn` | ISO-639 code to pin the connection to, or `auto` to let ElevenLabs detect. Detection is only requested when no code is sent, so `auto` is the only way to get it |
+| `ELEVENLABS_STT_LANGUAGE` | — | Same, applied to every language |
+| `TRANSCRIPTION_TIMEOUT_SECONDS` | `6.0` | Untranscribed speech before the warning fires. Empty to disable |
+| `LOG_TRANSCRIPT_TEXT` | `0` | Log the transcript text itself, not just its length and script. Off by default — it is the caller's own words |
+
+**Bengali defaults to auto-detect.** Pinning `language_code=bn` produced no transcript on a live call while English — same pipeline, same server-VAD settings, same build — worked. Auto-detect also matches what this profile's `stt_language_codes` has always described and the ElevenLabs path otherwise ignored: Bengali speakers drop English words mid-sentence, and a connection pinned to one code cannot represent that. `ELEVENLABS_STT_LANGUAGE_BN=bn` pins it back. If auto-detect also produces nothing, the recognizer is the problem rather than the code — `STT_PROVIDER_BN=google` moves that one language onto a different one without touching the other four.
+
+**Where the worker runs matters as much as any of these.** Running `dev` on a laptop outside the region of ElevenLabs, Vertex and LiveKit's inference gateway adds a round trip to every one of those hops, several times per turn. If the numbers above look good and calls still feel slow, deploy the agent (`lk agent deploy`, see `livekit.toml`) and compare the same log lines from there.
+
 ## Customize your agent
 
 Once your agent is running, enhance it for your use case:
