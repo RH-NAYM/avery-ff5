@@ -1240,7 +1240,14 @@ async def _record_call_summary(
     """Record a structured summary of the phone conversation for a business record.
 
     Args:
-        summary: 2-4 factual, concise sentences summarizing what was discussed.
+        summary: One or two short sentences, 40 words at most, covering ONLY
+            what the caller said about themselves -- their health, mood,
+            sleep, appetite, medication, plans, and anything they raised.
+            Always in English, whatever language the call was conducted in.
+            Facts only: no preamble ("The caller said that..."), no mention
+            of the agent, the questions asked, or how the call went. If the
+            caller said almost nothing, say that in a few words rather than
+            padding it out.
         concern_level: "urgent" if the caller disclosed something needing
             prompt human attention (an injury, a medical emergency, a safety
             concern, or severe distress). "watch" for a minor or ambiguous
@@ -1259,31 +1266,53 @@ async def _record_call_summary(
 
 
 async def summarize_session(summarizer, chat_ctx: ChatContext) -> CallSummary | None:
-    """Generate a structured summary of the user/assistant turns using a
+    """Generate a structured summary of *what the caller said*, using a
     separate, non-conversational LLM call that's forced to report through
     the `record_call_summary` tool instead of free text. Based on the
     "Summarizing context" pattern in the LiveKit Agents docs
     (agents/logic/agents-handoffs), extended with tool-calling so the result
-    is machine-actionable, not just human-readable."""
+    is machine-actionable, not just human-readable.
+
+    The agent's own turns are still sent to the summarizer, but only as
+    context. Nobody reading this record needs to be told what Avery asked --
+    they need to know what the person answered. The catch is that half those
+    answers are meaningless on their own ("a little", "yes", "since
+    Tuesday"), so dropping the questions before the model sees them would
+    produce a shorter summary by making it vaguer. The questions go in; only
+    the answers come out.
+    """
     summary_ctx = ChatContext()
     summary_ctx.add_message(
         role="system",
         content=(
-            "Summarize the following phone conversation for a business "
-            "record by calling record_call_summary exactly once."
+            "You are writing a business record of a wellbeing check-in phone "
+            "call. The transcript follows, one line per turn, labelled either "
+            "CALLER (the person who was phoned) or AGENT (the assistant who "
+            "phoned them).\n\n"
+            "Summarize ONLY what the CALLER said. The AGENT lines are present "
+            "for one reason: so you can tell what a short answer refers to. "
+            "Never describe what the agent asked, said or did, and never "
+            "mention the agent at all.\n\n"
+            "Report by calling record_call_summary exactly once."
         ),
     )
 
-    n_summarized = 0
+    n_caller_turns = 0
     for item in chat_ctx.items:
         if item.type != "message" or item.role not in ("user", "assistant"):
             continue
         item_text = (item.text_content or "").strip()
-        if item_text:
-            summary_ctx.add_message(role="user", content=f"{item.role}: {item_text}")
-            n_summarized += 1
+        if not item_text:
+            continue
+        speaker = "CALLER" if item.role == "user" else "AGENT"
+        summary_ctx.add_message(role="user", content=f"{speaker}: {item_text}")
+        if item.role == "user":
+            n_caller_turns += 1
 
-    if n_summarized == 0:
+    # No caller turns means there is nothing to summarize, even if the agent
+    # spoke: a call where the greeting played and the callee never answered
+    # would otherwise come back as a tidy summary of Avery talking to herself.
+    if n_caller_turns == 0:
         return None
 
     response = await summarizer.chat(

@@ -243,6 +243,83 @@ async def test_summarize_session_returns_none_for_empty_conversation() -> None:
     assert result is None
 
 
+def _summary_lines(summarizer) -> list[str]:
+    """The transcript as summarize_session actually handed it to the model."""
+    return [
+        (item.text_content or "")
+        for item in summarizer.last_kwargs["chat_ctx"].items
+        if item.type == "message" and item.role == "user"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_summary_transcript_marks_who_is_speaking() -> None:
+    """The summary is about the caller, so the model has to be able to tell
+    the two speakers apart. `user:`/`assistant:` are framework words with no
+    meaning to a summarizer reading a phone call."""
+    summarizer = _FakeSummarizer(_FakeCollectedResponse(text="x"))
+
+    await summarize_session(summarizer, _chat_ctx_with_turns())
+
+    lines = _summary_lines(summarizer)
+    assert "CALLER: I had a good day, went for a walk." in lines
+    assert "AGENT: That's wonderful to hear!" in lines
+
+
+@pytest.mark.asyncio
+async def test_the_agent_turns_are_kept_as_context_not_dropped() -> None:
+    """Half of what a caller says is meaningless without the question: "a
+    little", "yes", "since Tuesday". Dropping the agent's turns before the
+    summarizer sees them would make the summary shorter by making it vaguer,
+    so they stay in the input -- the *output* is what excludes them."""
+    ctx = ChatContext()
+    ctx.add_message(role="assistant", content="How have you been sleeping?")
+    ctx.add_message(role="user", content="Not so well.")
+    summarizer = _FakeSummarizer(_FakeCollectedResponse(text="x"))
+
+    await summarize_session(summarizer, ctx)
+
+    lines = _summary_lines(summarizer)
+    assert any("How have you been sleeping?" in line for line in lines)
+
+    instructions = [
+        (item.text_content or "")
+        for item in summarizer.last_kwargs["chat_ctx"].items
+        if item.type == "message" and item.role == "system"
+    ]
+    assert len(instructions) == 1
+    # ...and the instruction is what keeps them out of the summary.
+    assert "ONLY what the CALLER said" in instructions[0]
+
+
+@pytest.mark.asyncio
+async def test_a_call_the_callee_never_spoke_on_produces_no_summary() -> None:
+    """The greeting plays, the callee never answers, the call ends. There is
+    nothing to record about them -- and summarizing the transcript anyway
+    would return a tidy paragraph about Avery talking to herself, which reads
+    like a normal call in the API response."""
+    ctx = ChatContext()
+    ctx.add_message(role="assistant", content="Hi there, it's Avery calling.")
+    ctx.add_message(role="assistant", content="Are you there?")
+    summarizer = _FakeSummarizer(_FakeCollectedResponse(text="A pleasant call."))
+
+    assert await summarize_session(summarizer, ctx) is None
+    # The model must not even be asked -- that is a billed call producing a
+    # summary that would be wrong however good it looked.
+    assert summarizer.last_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_the_summary_schema_asks_for_the_caller_only_and_in_english() -> None:
+    """The tool's own argument description is what the model actually reads,
+    so the brief lives there, not only in the system prompt."""
+    description = json.dumps(agent_module._record_call_summary.__doc__)
+
+    assert "40 words at most" in description
+    assert "ONLY" in description
+    assert "English" in description
+
+
 # --- Immediate greeting on answer -------------------------------------------
 # The opening line is spoken straight to TTS instead of being generated, so
 # these check which line gets chosen for which persona. Fully offline.
